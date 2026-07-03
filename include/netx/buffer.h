@@ -29,7 +29,14 @@ namespace netx
         const char*peek() const {return begin()+reader_index_;}//指向第一个未读字节
         char *begin_write(){return begin()+writer_index_;}
         const char *begin_write() const {return begin()+writer_index_;}
+        
+        void retrieve(size_t len);
+        void retrieve_all();
+        void append(const void *data, size_t len);
+        void append(std::string_view sv) { append(sv.data(), sv.size()); }
+        void ensure_writable(size_t len);
 
+        ssize_t read_fd(int fd, int *saved_errno);
     private:
         char *begin(){return pool_ptr_?pool_ptr_:heap_buf_.data();}
         const char *begin()const{return pool_ptr_?pool_ptr_:heap_buf_.data();}
