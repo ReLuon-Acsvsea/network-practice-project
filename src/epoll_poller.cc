@@ -103,7 +103,7 @@ int EpollPoller::Poll(int timeout_ms, const epoll_event ** out_events){
        }
   }
 #endif
-    while (true) { //ubuntu20.04实际是用epoll_wait
+    while (true) { 
         int n = ::epoll_wait(epfd_, events_.data(), static_cast<int>(events_.size()), timeout_ms);
         if (n < 0) {
         if (errno == EINTR) {

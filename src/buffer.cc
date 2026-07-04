@@ -1,5 +1,6 @@
 #include "netx/buffer.h"
 #include <cstring>
+#include <sys/uio.h>
 // Optimization: Prefetch for write index
 #if defined(__GNUC__) || defined(__clang__)
 #define NETX_PREFETCH(addr) __builtin_prefetch(addr)
@@ -94,9 +95,53 @@ void Buffer::ensure_writable(size_t len){
 
 // 扩展可写空间：优先移动数据，必要时扩容
 void Buffer::make_space(size_t len){
-    
+    size_t writeable = writeable_bytes();
+    size_t prependable = prependable_bytes();//已读空间
+    if(writeable+prependable-kPrepend < len){//必须扩容
+        if(pool_ptr_)//当前使用池
+        {
+            size_t readable = readable_bytes();
+            heap_buf_.resize(kPrepend + readable +len);
+            //可读数据从池拷贝到堆
+            std::memcpy(heap_buf_.data()+kPrepend,peek(),readable);
+            reader_index_=kPrepend;
+            writer_index_=reader_index_+readable;
+
+            g_tls_pool.Release(pool_ptr_);
+            pool_ptr_=nullptr;
+            pool_capacity_=0;
+        }else{//当前使用堆
+            heap_buf_.resize(writer_index_+len);
+        }
+    }else{//整理空间
+        size_t readable = readable_bytes();
+        std::memmove(begin()+kPrepend,peek(),readable);
+        reader_index_=kPrepend;
+        writer_index_=reader_index_+readable;
+    }
 }
 
-
+ssize_t Buffer::read_fd(int fd, int * saved_errno){
+    char extrabuf[65536];
+    struct iovec iov[2];
+    const size_t writable = writeable_bytes();
+    iov[0].iov_base= begin_write();
+    iov[0].iov_len= writable;
+    iov[1].iov_base=extrabuf;
+    iov[1].iov_len=sizeof(extrabuf);
+    const int iovcnt = (writable<sizeof(extrabuf))?2:1;
+    const ssize_t n =::readv(fd, iov, iovcnt);
+    if(n<0){
+        *saved_errno = errno;
+        return n;
+    }else if(static_cast<size_t>(n)<=writable){
+        writer_index_+=n;
+    }else{
+        size_t cap =pool_ptr_ ? pool_capacity_ : heap_buf_.size();
+        writer_index_ =cap;
+        append(extrabuf,n-writable);
+    }
+    return n;
+}
 
 }

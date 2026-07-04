@@ -86,7 +86,7 @@ void EventLoop::RunInLoop(Task cb)
         QueueInLoop(std::move(cb));
     }
 }
-
+// 将任务加入队列：跨线程时/合并唤醒 唤醒事件循环
 void EventLoop::QueueInLoop(Task cb){
     {
         std::lock_guard<std::mutex> lk(pending_mu_);
@@ -149,7 +149,7 @@ void EventLoop::DoPendingTasks(){
     if(pending_tasks_.empty()) return;
     pending_tasks_.swap(pending_buffer_);
   }
-  calling_pending_ = true;
+  calling_pending_ = true;//执行事件时都为ture
   for(auto &task:pending_buffer_){
     task();
   }
