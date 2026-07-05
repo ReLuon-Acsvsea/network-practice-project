@@ -22,8 +22,7 @@ public:
     std::string to_header_string() const; // 仅序列化响应行与头（不含 body）
     
     /*将响应行与头写入外部缓冲，不分配内存；返回是否成功（缓冲不足则返回 false）
-    cap = 缓冲区容量（capacity），告诉函数"你最多能写多少字节"
-    out_len = 输出参数，函数写完后告诉你"实际写了多少字节"*/
+    cap = 缓冲区容量 out_len = 返回写了多少字节*/
     bool format_header_into(char *buf, size_t cap, size_t *out_len) const;
     
     const std::string &body() const { return body_; }

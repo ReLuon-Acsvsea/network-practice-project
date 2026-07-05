@@ -24,10 +24,14 @@ public:
     
     HttpServer(EventLoop *loop, const InetAddress& addr, int io_threads, bool reuse_port);
 
-    void Get(const std::string &path, Handler h)
-    {
-    
-    }
+    void Get(const std::string &path, Handler h) {get_handlers_[path] = std::move(h);}
+    void Post(const std::string& path, Handler h) { post_handlers_[path] = std::move(h); }
+
+    // 注册静态 GET 响应：预构建两份完整 HTTP 响应（keep-alive 和 close）
+    void GetStatic(const std::string& path, std::string body, const std::string& content_type = "text/plain");
+
+    // 启动服务器（内部调用 server_.Start()，开始监听 + 接受连接）
+    void Start();
 private:
     void OnConnection(const ConnectionPtr& c);
 
@@ -44,9 +48,13 @@ private:
     struct StaticResponse {
         std::string keep;
         std::string close;
-    }
+    };
+    std::unordered_map<std::string, StaticResponse> static_get_;  // 静态 GET 路由表
 
-
+    // GET "/" 的极致快路径：用 bool 判断跳过 hash 查找
+    // 根路径是最热的（健康检查、首页），值得单独优化
+    bool static_root_enabled_ = false;
+    StaticResponse static_root_;
 
 };
 

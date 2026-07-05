@@ -53,19 +53,16 @@ public:
 
 private:
     Method method_=Method::kUnsupported;
-    std::string path_;
+    mutable std::string path_;
     std::string_view path_view_{};
     int http_major_ = 1;//HTTP major version
     int http_minor_ = 1;//HTTP second version
     std::unordered_map<std::string,std::string> headers_;//存储的头部
-    std::string body_;
+    mutable std::string body_;
     std::string_view body_view_{};
     bool keep_alive_cached_ =false;//是否已缓存了keep-alive判断
     bool keep_alive_value_ = true;//缓存的值true keep-alive false close
-    static::std::string NormalizeHeaderKey(std::string_view key);//头部key格式化(首字母大写)
-
-
-
+    static std::string NormalizeHeaderKey(std::string_view key);//头部key格式化
 };
 
 
