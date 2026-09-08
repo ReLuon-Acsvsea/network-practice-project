@@ -1,3 +1,4 @@
+// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_TCP_SERVER_H_
 #define NETX_TCP_SERVER_H_
 
@@ -44,7 +45,7 @@ class TcpServer {
   void NewConnectionInLoop(EventLoop* io, int fd, const InetAddress& peer);//QueueInLoop 投递到目标线程，创建 TcpConnection
   void RemoveConnection(const ConnectionPtr& conn);//QueueInLoop 投递到所属线程，从 map 删除连接
 
-  EventLoop* base_loop_;// 主线程 EventLoop：不拥有，只持有指针。Acceptor 挂在这个 loop 上（单 Acceptor模式）
+  EventLoop* base_loop_;// 主线程 EventLoop：不拥有，只持有指针。Acceptor 挂在这个 loop 上（单 Acceptor模式）。生命周期由外部管理（main 函数里创建）。
   std::unique_ptr<IoThreadPool> io_pool_;// IO 线程池：独占所有权，TcpServer 销毁时自动销毁线程池
   std::vector<std::unique_ptr<Acceptor>> acceptors_;//Acceptor 列表：单 Acceptor 模式时只有一个，reuse_port 模式时每个 IO 线程一个。unique_ptr 独占所有权
   InetAddress listen_addr_;//监听地址：值拷贝存储，不引用外部

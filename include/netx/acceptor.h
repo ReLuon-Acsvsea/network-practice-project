@@ -1,3 +1,4 @@
+// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_ACCEPTOR_H_
 #define NETX_ACCEPTOR_H_
 
@@ -8,6 +9,7 @@
 
 namespace netx
 {
+
     class EventLoop;
     class Channel;
     class Socket;
@@ -16,28 +18,36 @@ namespace netx
     class Acceptor
     {
     public:
-        //新连接来时的回调，参数为新连接fd和对端地址
-        using NewConnCallback =std::function<void(int, const InetAddress &)>;
-    
-        Acceptor(EventLoop *loop,const InetAddress& listen_addr,bool reuse_port);
+        // 新连接到来时的回调：参数为新连接 fd 和对端地址
+        using NewConnCallback = std::function<void(int, const InetAddress &)>;
+
+        // loop: 所属 EventLoop；listen_addr: 监听地址；reuse_port: 是否开启 SO_REUSEPORT
+        Acceptor(EventLoop *loop, const InetAddress &listen_addr, bool reuse_port);
         ~Acceptor();
 
-        void SetNewConnCallback(NewConnCallback cb){new_conn_cb_=std::move(cb);}
+        // 设置新连接回调，由上层（通常是 TcpServer）提供
+        void SetNewConnCallback(NewConnCallback cb) { new_conn_cb_ = std::move(cb); }
+        // 启动监听（listen + 注册读事件）
         void Listen();
 
     private:
-        void HandleRead();//回调函数
+        // 监听 fd 可读时被回调，执行 accept 并触发 NewConnCallback
+        void HandleRead();
 
+        // 所属 EventLoop（通常为主 Reactor）
         EventLoop *loop_;
+        // 监听 socket 封装
         std::unique_ptr<Socket> listen_sock_;
+        // 负责监听 fd 读写事件的 Channel
         std::unique_ptr<Channel> listen_channel_;
+        // 监听地址，仅作记录
         InetAddress listen_addr_;
-        bool listening_ =false;
-
+        // 是否已经开始 listen
+        bool listening_ = false;
+        // 新连接回调
         NewConnCallback new_conn_cb_;
-
-        
-
     };
-}
-#endif
+
+} // namespace netx
+
+#endif // NETX_ACCEPTOR_H_

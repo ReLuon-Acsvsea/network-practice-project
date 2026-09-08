@@ -1,82 +1,45 @@
 #include "netx/tcp_connection.h"
+
 #include "netx/channel.h"
 #include "netx/event_loop.h"
 #include "netx/socket.h"
 #include "netx/logging.h"
 
+#include <cerrno>
+#include <sys/epoll.h>
 #include <sys/socket.h>
-#include <unistd.h>
 #include <sys/uio.h>
-namespace netx{
+#include <unistd.h>
+
+namespace netx {
+
+// 构造函数：创建 TCP 连接对象并注册事件回调
 TcpConnection::TcpConnection(EventLoop *loop, int fd)
-: loop_(loop), socket_(new Socket(fd)), channel_(new Channel(loop, fd)),
-      input_(), output_(), state_(State::kConnected), context_(){
-    channel_->set_read_callback([this]() { this->HandleRead(); });
-    channel_->set_write_callback([this]() { this->HandleWrite(); });
-    channel_->set_close_callback([this]() { this->HandleClose(); });
-    channel_->set_error_callback([this]() { this->HandleError(); });
-    channel_->enable_reading();
-}
-TcpConnection::~TcpConnection(){}
-int TcpConnection::fd() const{return socket_->fd();}
-bool TcpConnection::IsConnected() const { return state_ == State::kConnected; }
-void TcpConnection::set_context(std::any ctx) { context_ = std::move(ctx); }
-void TcpConnection::Send(const std::string &s) {
-  if (loop_->IsInLoopThread()) {
-    SendInLoop(s.data(), s.size());
-  } else {
-    auto self = shared_from_this();
-    std::string copy = s;
-    loop_->QueueInLoop([self, data = std::move(copy)]() mutable {
-      self->SendInLoop(data.data(), data.size());
-    });
-  }
+    : loop_(loop), socket_(new Socket(fd)), channel_(new Channel(loop, fd)),
+      input_(), output_(), state_(State::kConnected), context_() {
+  channel_->set_read_callback([this]() { this->HandleRead(); });
+  channel_->set_write_callback([this]() { this->HandleWrite(); });
+  channel_->set_close_callback([this]() { this->HandleClose(); });
+  channel_->set_error_callback([this]() { this->HandleError(); });
+  channel_->enable_reading();
 }
 
-void TcpConnection::Send(std::string &&s) {
-  if (loop_->IsInLoopThread()) {
-    SendInLoop(s.data(), s.size());
-  } else {
-    auto self = shared_from_this();
-    std::string payload = std::move(s);
-    loop_->QueueInLoop([self, data = std::move(payload)]() mutable {
-      self->SendInLoop(data.data(), data.size());
-    });
-  }
-}
+// 析构函数
+TcpConnection::~TcpConnection() {}
 
-void TcpConnection::Send(const char *data, size_t len) {
-  if (loop_->IsInLoopThread()) {
-    SendInLoop(data, len);
-  } else {
-    auto self = shared_from_this();
-    std::string copy(data, len);
-    loop_->QueueInLoop([self, payload = std::move(copy)]() mutable {
-      self->SendInLoop(payload.data(), payload.size());
-    });
-  }
-}
-
-void TcpConnection::SendVec(const char *data1, size_t len1, const char *data2,
-                            size_t len2) {
-  if (loop_->IsInLoopThread()) {
-    SendVecInLoop(data1, len1, data2, len2);
-  } else {
-    auto self = shared_from_this();
-    std::string header(data1, len1);
-    std::string body(data2, len2);
-    loop_->QueueInLoop(
-        [self, h = std::move(header), b = std::move(body)]() mutable {
-          self->SendVecInLoop(h.data(), h.size(), b.data(), b.size());
-        });
-  }
-}
-
-void TcpConnection::Shutdown() { ::shutdown(fd(), SHUT_WR); }
-
+// 绑定自身生命周期：防止事件处理时被析构
 void TcpConnection::Tie(const std::shared_ptr<TcpConnection> &self) {
   channel_->tie(self);
 }
+
+// 获取文件描述符
+int TcpConnection::fd() const { return socket_->fd(); }
+
+// 判断是否已连接
+bool TcpConnection::IsConnected() const { return state_ == State::kConnected; }
+
+// 设置上下文对象
+void TcpConnection::set_context(std::any ctx) { context_ = std::move(ctx); }
 
 // 处理可读事件：读取数据并回调上层
 void TcpConnection::HandleRead() {
@@ -140,6 +103,61 @@ void TcpConnection::HandleClose() {
 
 // 处理错误：直接关闭连接
 void TcpConnection::HandleError() { HandleClose(); }
+
+// 发送数据（const string&）：跨线程则复制数据
+void TcpConnection::Send(const std::string &s) {
+  if (loop_->IsInLoopThread()) {
+    SendInLoop(s.data(), s.size());
+  } else {
+    auto self = shared_from_this();
+    std::string copy = s;
+    loop_->QueueInLoop([self, data = std::move(copy)]() mutable {
+      self->SendInLoop(data.data(), data.size());
+    });
+  }
+}
+
+// 发送数据（string&&）：跨线程移动数据
+void TcpConnection::Send(std::string &&s) {
+  if (loop_->IsInLoopThread()) {
+    SendInLoop(s.data(), s.size());
+  } else {
+    auto self = shared_from_this();
+    std::string payload = std::move(s);
+    loop_->QueueInLoop([self, data = std::move(payload)]() mutable {
+      self->SendInLoop(data.data(), data.size());
+    });
+  }
+}
+
+// 发送数据（原始指针）：跨线程则复制数据
+void TcpConnection::Send(const char *data, size_t len) {
+  if (loop_->IsInLoopThread()) {
+    SendInLoop(data, len);
+  } else {
+    auto self = shared_from_this();
+    std::string copy(data, len);
+    loop_->QueueInLoop([self, payload = std::move(copy)]() mutable {
+      self->SendInLoop(payload.data(), payload.size());
+    });
+  }
+}
+
+// 发送两段数据：使用 writev 减少拷贝
+void TcpConnection::SendVec(const char *data1, size_t len1, const char *data2,
+                            size_t len2) {
+  if (loop_->IsInLoopThread()) {
+    SendVecInLoop(data1, len1, data2, len2);
+  } else {
+    auto self = shared_from_this();
+    std::string header(data1, len1);
+    std::string body(data2, len2);
+    loop_->QueueInLoop(
+        [self, h = std::move(header), b = std::move(body)]() mutable {
+          self->SendVecInLoop(h.data(), h.size(), b.data(), b.size());
+        });
+  }
+}
 
 // 在事件循环中发送数据：优先直接写，未完成则入缓冲区
 void TcpConnection::SendInLoop(const char *data, size_t len) {
@@ -270,4 +288,8 @@ void TcpConnection::SendVecInLoop(const char *data1, size_t len1,
     }
   }
 }
-}
+
+// 关闭写端：触发 FIN 包
+void TcpConnection::Shutdown() { ::shutdown(fd(), SHUT_WR); }
+
+} // namespace netx

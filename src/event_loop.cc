@@ -7,157 +7,170 @@
 #include <thread>
 #include <unistd.h>
 
-namespace netx{
+namespace netx {
 
 namespace {
-
-//获取当前线程id
-unsigned long Tid(){
-    thread_local unsigned long cached =0;
-    if(cached==0){
+// 获取当前线程 ID（缓存以提高性能）
+unsigned long Tid() {
+  thread_local unsigned long cached = 0;
+  if (cached == 0) {
 #ifdef SYS_gettid
     cached = static_cast<unsigned long>(::syscall(SYS_gettid));
 #else
     cached = static_cast<unsigned long>(
         ::syscall(186)); // fallback for older headers
 #endif
-    }
-    return cached;
+  }
+  return cached;
 }
+} // namespace
 
-}//namespace
-
+// 构造函数：创建 eventfd 用于跨线程唤醒
 EventLoop::EventLoop(bool /*single_thread_mode*/)
-    :wakeup_fd_(::eventfd(0,EFD_NONBLOCK | EFD_CLOEXEC)),
-    wakeup_channel_(nullptr),
-    tid_(Tid()){
-    wakeup_channel_=new Channel(this,wakeup_fd_);
-    wakeup_channel_->set_read_callback([this](){HandleWakeup();});
-    wakeup_channel_->enable_reading();
+    : wakeup_fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
+      wakeup_channel_(nullptr),
+      // events_(),
+      tid_(Tid()) {
+  wakeup_channel_ = new Channel(this, wakeup_fd_);
+  wakeup_channel_->set_read_callback([this]() { HandleWakeup(); });
+  wakeup_channel_->enable_reading();
 
-    pending_tasks_.reserve(16);
-    pending_buffer_.reserve(16);
+  // Pre-reserve some space for tasks to avoid initial allocs
+  pending_tasks_.reserve(16);
+  pending_buffer_.reserve(16);
 }
 
-EventLoop::~EventLoop(){
-    if(wakeup_channel_){
-        wakeup_channel_->disable_all();
-        wakeup_channel_->remove();
-        delete wakeup_channel_;
-    }
-    if(wakeup_fd_>=0)
+// 析构函数：清理资源
+EventLoop::~EventLoop() {
+  if (wakeup_channel_) {
+    wakeup_channel_->disable_all();
+    wakeup_channel_->remove();
+    delete wakeup_channel_;
+  }
+  if (wakeup_fd_ >= 0)
+    ::close(wakeup_fd_);
+}
+
+// 判断当前线程是否为事件循环所属线程
+bool EventLoop::IsInLoopThread() const { return Tid() == tid_; }
+
+// 事件循环主函数：等待并处理 IO 事件和待执行任务
+void EventLoop::Loop() {
+  while (!quit_) {
+    // events_.clear();
+    // 队列非空则立刻返回（timeout=0），否则给一个较长超时以减少空转
+    bool empty;
     {
-        ::close(wakeup_fd_);
+      std::lock_guard<std::mutex> lk(pending_mu_);
+      empty = pending_tasks_.empty();//检查队列里有没有任务
     }
-}
-
-bool EventLoop::IsInLoopThread() const {return Tid()==tid_;}
-
-void EventLoop::Loop(){
-    while(!quit_){
-        bool empty;
-        {
-            std::lock_guard<std::mutex> lk(pending_mu_);
-            empty=pending_tasks_.empty();
-        }
-        int timeout_ms =empty?-1:0;
-        const epoll_event* evs =nullptr;
-        int n =poller_.Poll(timeout_ms,&evs);
-        for(int i=0;i<n;++i)
-        {
-            const auto &ev=evs[i];
-            auto *ch=static_cast<Channel*>(ev.data.ptr);
-            ch->set_revents(ev.events);
-            ch->handle_event();
-        }
-        DoPendingTasks();
+    // 空队列时阻塞等待事件（-1）。若未来加入定时器，将以最早到期时间作为超时值或使用 timerfd 唤醒。
+    int timeout_ms = empty ? -1 : 0;
+    const epoll_event* evs = nullptr;
+    int n = poller_.Poll(timeout_ms, &evs);
+    for (int i = 0; i < n; ++i) {
+      const auto &ev = evs[i];
+      auto *ch = static_cast<Channel *>(ev.data.ptr);
+      ch->set_revents(ev.events);
+      ch->handle_event();
     }
-}
-void EventLoop::Quit(){
-    quit_ = true;
-    Wakeup();//退出时也要唤醒方便完成剩余的下班
+    DoPendingTasks();//执行任务队列
+  }
 }
 
-void EventLoop::RunInLoop(Task cb)
-{
-    if(IsInLoopThread()){
-        cb();
-    }else{
-        QueueInLoop(std::move(cb));
-    }
-}
-// 将任务加入队列：跨线程时/合并唤醒 唤醒事件循环
-void EventLoop::QueueInLoop(Task cb){
-    {
-        std::lock_guard<std::mutex> lk(pending_mu_);
-        pending_tasks_.emplace_back(std::move(cb));
-    }
-    if(!IsInLoopThread() || calling_pending_){
-        bool expected = false;
-        if(wakeup_pending_.compare_exchange_strong(expected,true,
-        std::memory_order_relaxed))
-        {
-            Wakeup();
-        }
-    }
+// 退出事件循环
+void EventLoop::Quit() {
+  quit_ = true;
+  Wakeup();//把 epoll_wait 从阻塞中叫醒，让它有机会检查 quit_ 并退出
 }
 
-void  EventLoop::UpdateChannel(Channel *ch){
-    if(!ch->registered()){
-        if(ch->events()!=0)
-        {
-            poller_.Add(ch,ch->events());
-            ch->set_registered(true);
-            ch->set_registered_events(ch->events());
-        }
-    }else{
-        if(ch->events()==0){
-            poller_.Del(ch);
-            ch->set_registered(false);
-            ch->set_registered_events(0);
-        }else{
-            poller_.Mod(ch,ch->events());
-            ch->set_registered_events(ch->events());
-        }
-    }
+// 在事件循环中执行任务：同线程则立即执行，否则加入队列
+void EventLoop::RunInLoop(Task cb) {
+  if (IsInLoopThread()) {
+    cb();
+  } else {
+    QueueInLoop(std::move(cb));
+  }
 }
 
-void EventLoop::RemoveChannel(Channel *ch){
-    if(ch->registered()){
-        poller_.Del(ch);
-        ch->set_registered(false);
-        ch->set_registered_events(0);
-    }
-}
-
-
-void EventLoop::Wakeup(){
-    uint64_t one =1;
-    ::write(wakeup_fd_,&one,sizeof(one));
-}
-
-void EventLoop::HandleWakeup(){
-    uint64_t x;
-    while(::read(wakeup_fd_,&x,sizeof(x))>0){
-    }
-    wakeup_pending_.store(false,std::memory_order_relaxed);
-}
-
-void EventLoop::DoPendingTasks(){
+// 将任务加入队列：跨线程时唤醒事件循环
+void EventLoop::QueueInLoop(Task cb) {
   {
     std::lock_guard<std::mutex> lk(pending_mu_);
-    if(pending_tasks_.empty()) return;
+    pending_tasks_.emplace_back(std::move(cb));
+  }
+
+  // 跨线程入队：合并唤醒，避免重复写 eventfd
+  // 或者如果正在处理 PendingTasks，也需要唤醒以确保立刻执行新任务
+  if (!IsInLoopThread() || calling_pending_) {
+    bool expected = false;
+    if (wakeup_pending_.compare_exchange_strong(expected, true,
+                                                std::memory_order_relaxed)) {
+      Wakeup();
+    }
+  }
+}
+
+// 更新 Channel 的事件注册
+void EventLoop::UpdateChannel(Channel *ch) {
+  if (!ch->registered()) {
+    if (ch->events() != 0) {
+      poller_.Add(ch, ch->events());
+      ch->set_registered(true);
+      ch->set_registered_events(ch->events());
+    }
+  } else {
+    if (ch->events() == 0) {
+      poller_.Del(ch);
+      ch->set_registered(false);
+      ch->set_registered_events(0);
+    } else {
+      poller_.Mod(ch, ch->events());
+      ch->set_registered_events(ch->events());
+    }
+  }
+}
+
+// 从 epoll 中移除 Channel
+void EventLoop::RemoveChannel(Channel *ch) {
+  if (ch->registered()) {
+    poller_.Del(ch);
+    ch->set_registered(false);
+    ch->set_registered_events(0);
+  }
+}
+
+// 唤醒事件循环：写入 eventfd
+void EventLoop::Wakeup() {
+  uint64_t one = 1;
+  ::write(wakeup_fd_, &one, sizeof(one));
+}
+
+// 处理唤醒事件：读取 eventfd 并清除标志
+void EventLoop::HandleWakeup() {
+  uint64_t x;
+  while (::read(wakeup_fd_, &x, sizeof(x)) > 0) {
+  }
+  // 清除挂起标志，允许后续唤醒
+  wakeup_pending_.store(false, std::memory_order_relaxed);
+}
+
+// 执行待处理任务：批量交换并执行，减少锁竞争
+void EventLoop::DoPendingTasks() {
+  {
+    std::lock_guard<std::mutex> lk(pending_mu_);
+    if (pending_tasks_.empty())
+      return;
     pending_tasks_.swap(pending_buffer_);
   }
-  calling_pending_ = true;//执行事件时都为ture
-  for(auto &task:pending_buffer_){
+
+  calling_pending_ = true;
+// 批量处理所有待处理任务（无锁）
+  for (auto &task : pending_buffer_) {
     task();
   }
-  pending_buffer_.clear();
+  pending_buffer_.clear(); // clear content but keep capacity
   calling_pending_ = false;
-
 }
 
-
-
-}
+} // namespace netx

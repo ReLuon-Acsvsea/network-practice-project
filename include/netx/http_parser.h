@@ -1,3 +1,4 @@
+// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_HTTP_PARSER_H_
 #define NETX_HTTP_PARSER_H_
 
@@ -7,18 +8,20 @@
 #include "netx/buffer.h"
 #include "netx/http_request.h"
 
-namespace netx
-{
-//HttpParser 从buffer中按HTTP协议解析出请求
-//不完整时返回false
-class HttpParser{
-    public:
-        bool Parse(Buffer *buf, HttpRequest*req);
-    private:
-        bool ParseRequesetLine(const char* begin ,const char* end, HttpRequest* req,size_t * consumed);
+namespace netx {
+
+// HttpParser 从 Buffer 中按 HTTP 协议解析出一个 HttpRequest，请求不完整时返回 false
+class HttpParser {
+ public:
+  // Return true if one full request parsed into req; false if need more data; throws on error
+  bool Parse(Buffer* buf, HttpRequest* req);
+
+ private:
+  bool ParseRequestLine(const char* begin, const char* end, HttpRequest* req, size_t* consumed);
 };
-    
-} // namespace netx
+
+}  // namespace netx
+
+#endif  // NETX_HTTP_PARSER_H_
 
 
-#endif

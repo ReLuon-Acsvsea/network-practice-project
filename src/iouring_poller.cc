@@ -8,9 +8,14 @@
 #include <errno.h>
 #include <linux/time_types.h>
 #include <poll.h>
+#include <arpa/inet.h>
+#include <chrono>
 #include <cstring>
+#include <fstream>
+#include <ios>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace netx {
 
@@ -56,9 +61,33 @@ std::string IoErrorString(int ret) {
   int err = ret < 0 ? -ret : ret;
   return std::string(std::strerror(err));
 }
+
+// 检测是否为 WSL2 环境（io_uring 对 TCP socket 不支持）
+bool IsWSL2() {
+  std::ifstream f("/proc/version");
+  if (f.is_open()) {
+    std::string line;
+    std::getline(f, line);
+    // WSL2 内核版本字符串包含 "microsoft" 或 "WSL"
+    for (auto& c : line) c = static_cast<char>(std::tolower(c));
+    if (line.find("microsoft") != std::string::npos ||
+        line.find("wsl") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
 }  // namespace
 
 IoUringPoller::IoUringPoller() : ready_events_(128) {
+  // WSL2 的 io_uring 对 TCP socket 不支持 POLL_ADD/ACCEPT/READ
+  // 自动回退到 epoll 后端
+  if (IsWSL2()) {
+    use_epoll_fallback_ = true;
+    LOG_INFO << "WSL2 detected, io_uring TCP not supported, falling back to epoll";
+    return;
+  }
+
   int rc = ::io_uring_queue_init(kQueueDepth, &ring_, 0);
   if (rc < 0) {
     throw std::runtime_error("io_uring_queue_init failed: " + IoErrorString(rc));
@@ -66,7 +95,11 @@ IoUringPoller::IoUringPoller() : ready_events_(128) {
   LOG_INFO << "io_uring initialized, depth=" << kQueueDepth;
 }
 
-IoUringPoller::~IoUringPoller() { ::io_uring_queue_exit(&ring_); }
+IoUringPoller::~IoUringPoller() {
+  if (!use_epoll_fallback_) {
+    ::io_uring_queue_exit(&ring_);
+  }
+}
 
 uint32_t IoUringPoller::AllocId() {
   uint32_t id = next_id_++;
@@ -119,6 +152,7 @@ void IoUringPoller::SubmitPollRemove(Watcher* watcher) {
 }
 
 void IoUringPoller::Add(Channel* ch, uint32_t events) {
+  if (use_epoll_fallback_) { fallback_.Add(ch, events); return; }
   if (events == 0) return;
   if (watchers_.count(ch)) {
     Mod(ch, events);
@@ -141,6 +175,7 @@ void IoUringPoller::Add(Channel* ch, uint32_t events) {
 }
 
 void IoUringPoller::Mod(Channel* ch, uint32_t events) {
+  if (use_epoll_fallback_) { fallback_.Mod(ch, events); return; }
   auto it = watchers_.find(ch);
   if (it == watchers_.end()) {
     Add(ch, events);
@@ -158,6 +193,7 @@ void IoUringPoller::Mod(Channel* ch, uint32_t events) {
 }
 
 void IoUringPoller::Del(Channel* ch) {
+  if (use_epoll_fallback_) { fallback_.Del(ch); return; }
   auto it = watchers_.find(ch);
   if (it == watchers_.end()) return;
   auto* watcher = it->second.get();
@@ -246,6 +282,9 @@ void IoUringPoller::MaybeCleanup(Watcher* watcher) {
 }
 
 int IoUringPoller::Poll(int timeout_ms, const epoll_event** out_events) {
+  if (use_epoll_fallback_) {
+    return fallback_.Poll(timeout_ms, out_events);
+  }
   ready_events_.clear();
   int submit_rc = ::io_uring_submit(&ring_);
   if (submit_rc < 0) {
@@ -254,24 +293,36 @@ int IoUringPoller::Poll(int timeout_ms, const epoll_event** out_events) {
 
   io_uring_cqe* cqe = nullptr;
   int wait_rc = 0;
-  do {
-    if (timeout_ms >= 0) {
-      __kernel_timespec ts{};
-      ts.tv_sec = timeout_ms / 1000;
-      ts.tv_nsec = static_cast<long long>(timeout_ms % 1000) * 1000000LL;
-      wait_rc = ::io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
-    } else {
-      wait_rc = ::io_uring_wait_cqe(&ring_, &cqe);
-    }
-  } while (wait_rc == -EINTR);
 
-  if (wait_rc == -ETIME || cqe == nullptr) {
-    LOG_DEBUG << "uring poll timeout ms=" << timeout_ms;
+  if (timeout_ms < 0) {
+    // 无限等待：阻塞直到有 CQE
+    do {
+      wait_rc = ::io_uring_wait_cqe(&ring_, &cqe);
+    } while (wait_rc == -EINTR);
+  } else if (timeout_ms == 0) {
+    // 非阻塞轮询：仅检查已有的 CQE
+    wait_rc = ::io_uring_peek_cqe(&ring_, &cqe);
+    if (wait_rc == -EAGAIN) {
+      ::io_uring_submit(&ring_);
+      wait_rc = ::io_uring_peek_cqe(&ring_, &cqe);
+    }
+  } else {
+    // 带超时等待
+    __kernel_timespec ts{};
+    ts.tv_sec = timeout_ms / 1000;
+    ts.tv_nsec = static_cast<long long>(timeout_ms % 1000) * 1000000LL;
+    do {
+      wait_rc = ::io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+    } while (wait_rc == -EINTR);
+  }
+
+  if ((wait_rc == -ETIME || wait_rc == -EAGAIN) && cqe == nullptr) {
     *out_events = nullptr;
     return 0;
   }
   if (wait_rc < 0) {
-    LOG_WARN << "io_uring wait error: " << IoErrorString(wait_rc);
+    LOG_WARN << "io_uring wait error: " << IoErrorString(wait_rc)
+             << " wait_rc=" << wait_rc;
     *out_events = nullptr;
     return 0;
   }

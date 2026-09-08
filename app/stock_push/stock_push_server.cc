@@ -1,9 +1,9 @@
-// 高并发红绿灯推送服务器 Demo（基于 netx / epoll）
+// 股票推送服务器 Demo（基于 netx / epoll）
 //
 // 功能概要：
 // - 单机多连接长连接服务器
 // - 客户端通过 LOGIN / SUBSCRIBE / PING 协议与服务器交互
-// - 服务器内部模拟红绿灯状态变化，并向订阅该 light_id 的客户端推送 LIGHT_UPDATE
+// - 服务器内部模拟股票行情数据，并向订阅该股票代码的客户端推送 STOCK_UPDATE
 //
 // 说明：
 // - 为了实现简单、聚焦网络与并发，本文件将主要逻辑集中在一个编译单元中。
@@ -38,7 +38,6 @@
 #include "netx/logging.h"
 #include "netx/tcp_connection.h"
 #include "netx/tcp_server.h"
-#include "netx/traffic_light.h"
 #include "netx/websocket_server.h"
 
 using netx::Buffer;
@@ -47,7 +46,6 @@ using netx::InetAddress;
 using netx::HttpServer;
 using netx::TcpConnection;
 using netx::TcpServer;
-using netx::LightUpdate;
 using netx::WebSocketServer;
 
 namespace {
@@ -58,13 +56,22 @@ enum class MsgType : uint16_t {
   kSubscribe = 2,
   kPing = 3,
   kPong = 4,
-  kLightUpdate = 100,
+  kStockUpdate = 100,
+};
+
+// 行情更新数据
+struct StockUpdate {
+  std::string code;        // 股票代码
+  double price;            // 当前价格
+  double change_pct;       // 涨跌幅 (%)
+  uint64_t volume;         // 成交量
+  uint64_t timestamp;      // 时间戳 (毫秒)
 };
 
 // 会话状态：挂在 TcpConnection::context() 中
 struct Session {
   std::string user_id;
-  std::vector<uint32_t> subscribed_light_ids;
+  std::vector<std::string> subscribed_codes;
   std::chrono::steady_clock::time_point last_heartbeat;
 };
 
@@ -86,6 +93,54 @@ std::string MakePacket(MsgType type, const void* body, size_t body_len) {
     std::memcpy(p + sizeof(uint32_t) + sizeof(uint16_t), body, body_len);
   }
   return out;
+}
+
+// 构造 LOGIN 消息
+std::string BuildLogin(const std::string& user) {
+  uint16_t len = static_cast<uint16_t>(user.size());
+  uint16_t len_n = htons(len);
+  std::string body;
+  body.resize(sizeof(len_n) + user.size());
+  std::memcpy(body.data(), &len_n, sizeof(len_n));
+  std::memcpy(body.data() + sizeof(len_n), user.data(), user.size());
+  return MakePacket(MsgType::kLogin, body.data(), body.size());
+}
+
+// 构造 SUBSCRIBE 消息
+std::string BuildSubscribe(const std::vector<std::string>& codes) {
+  uint16_t cnt = static_cast<uint16_t>(codes.size());
+  uint16_t cnt_n = htons(cnt);
+  
+  // 计算总长度
+  size_t total_body_len = sizeof(cnt_n);
+  for (const auto& code : codes) {
+    total_body_len += sizeof(uint16_t) + code.size();
+  }
+  
+  std::string body;
+  body.resize(total_body_len);
+  char* p = body.data();
+  
+  // 写入数量
+  std::memcpy(p, &cnt_n, sizeof(cnt_n));
+  p += sizeof(cnt_n);
+  
+  // 写入每个股票代码
+  for (const auto& code : codes) {
+    uint16_t code_len = static_cast<uint16_t>(code.size());
+    uint16_t code_len_n = htons(code_len);
+    std::memcpy(p, &code_len_n, sizeof(code_len_n));
+    p += sizeof(code_len_n);
+    std::memcpy(p, code.data(), code.size());
+    p += code.size();
+  }
+  
+  return MakePacket(MsgType::kSubscribe, body.data(), body.size());
+}
+
+// 构造 PING 消息
+std::string BuildPing() {
+  return MakePacket(MsgType::kPing, nullptr, 0);
 }
 
 std::string ReadFileIfExists(const std::filesystem::path& path) {
@@ -111,23 +166,23 @@ constexpr char kFallbackIndexHtml[] = R"(<!DOCTYPE html>
 <html lang="zh">
 <head>
   <meta charset="utf-8" />
-  <title>高并发红绿灯推送-程序员老廖</title>
+  <title>股票行情推送系统</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <div class="container">
-    <h1>高并发消息推送架构(以红绿灯信息推送为例)</h1>
-    <h2>基于 epoll 的实时红绿灯推送</h2>
+    <h1>股票行情实时推送系统</h1>
+    <h2>基于 epoll 的实时股票行情推送</h2>
     <p class="status" id="status">正在连接...</p>
     <div class="controls">
-      <label>订阅红绿灯 ID（用逗号分隔）</label>
+      <label>订阅股票代码（用逗号分隔）</label>
       <div class="control-row">
-        <input id="light-input" value="1,2,3" />
+        <input id="stock-input" value="STOCK1,STOCK2,STOCK3" />
         <button id="subscribe-btn">更新订阅</button>
       </div>
     </div>
-    <div id="lights" class="lights"></div>
+    <div id="stocks" class="stocks"></div>
   </div>
   <script>
     window.__WS_PORT__ = {{WS_PORT}};
@@ -137,35 +192,40 @@ constexpr char kFallbackIndexHtml[] = R"(<!DOCTYPE html>
 </html>)";
 
 constexpr char kFallbackAppJs[] = R"(const statusEl=document.getElementById('status');
-const lightsEl=document.getElementById('lights');
-const inputEl=document.getElementById('light-input');
+const stocksEl=document.getElementById('stocks');
+const inputEl=document.getElementById('stock-input');
 const btnEl=document.getElementById('subscribe-btn');
 const wsPort=window.__WS_PORT__||(window.location.port||(window.location.protocol==='https:'?443:80));
 const wsScheme=window.location.protocol==='https:'?'wss':'ws';
 const wsUrl=`${wsScheme}://${window.location.hostname}:${wsPort}/ws`;
 let ws=null;let reconnectTimer=null;
-const lights=new Map();let currentIds=new Set();
+const stocks=new Map();let currentCodes=new Set();
+const codeToId=new Map();let nextId=1;
+const getId=(code)=>{if(!codeToId.has(code)){codeToId.set(code,nextId++);}
+return codeToId.get(code);};
 const setStatus=(text)=>{statusEl.textContent=text;};
-const render=()=>{if(lights.size===0){lightsEl.innerHTML='';lightsEl.style.display='none';return;}
-lightsEl.style.display='grid';lightsEl.innerHTML='';
-Array.from(lights.entries()).sort((a,b)=>a[0]-b[0]).forEach(([id,info])=>{
-const sec=Math.max(0,Math.round(info.remain_ms/1000));
+const render=()=>{if(stocks.size===0){stocksEl.innerHTML='';stocksEl.style.display='none';return;}
+stocksEl.style.display='grid';stocksEl.innerHTML='';
+Array.from(stocks.entries()).sort((a,b)=>a[0].localeCompare(b[0])).forEach(([code,info])=>{
+const changeClass=info.change_pct>=0?'up':'down';
 const card=document.createElement('div');
-card.className=`light-card ${info.state}`;
-card.innerHTML=`<div class="light-id">#${id}</div>
-<div class="light-state">${info.state.toUpperCase()}</div>
-<div class="light-remain">${sec} s</div>`;
-lightsEl.appendChild(card);
+card.className=`stock-card ${changeClass}`;
+card.innerHTML=`<div class="stock-code">${code}</div>
+<div class="stock-price">${info.price.toFixed(2)}</div>
+<div class="stock-change">${info.change_pct>=0?'+':''}${info.change_pct.toFixed(2)}%</div>
+<div class="stock-volume">成交量: ${info.volume.toLocaleString()}</div>`;
+stocksEl.appendChild(card);
 });};
 const send=(payload)=>{if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringify(payload));}};
-const sendSubscribe=()=>{const ids=(inputEl.value||'').split(',').map((id)=>id.trim()).filter(Boolean).map((id)=>parseInt(id,10)).filter((num)=>!Number.isNaN(num));
-currentIds=new Set(ids);lights.forEach((_,id)=>{if(!currentIds.has(id)){lights.delete(id);}});render();send({action:'subscribe',lights:ids});};
+const sendSubscribe=()=>{const codes=(inputEl.value||'').split(',').map((code)=>code.trim()).filter(Boolean);
+currentCodes=new Set(codes);stocks.forEach((_,code)=>{if(!currentCodes.has(code)){stocks.delete(code);}});
+const ids=codes.map(code=>getId(code));render();send({action:'subscribe',lights:ids});};
 const connect=()=>{setStatus(`连接中 ${wsUrl}`);ws=new WebSocket(wsUrl);
 ws.onopen=()=>{setStatus('连接成功');send({action:'login',user_id:`web-${Date.now()}`});sendSubscribe();};
 ws.onmessage=(evt)=>{try{const msg=JSON.parse(evt.data);
-if(msg.type==='light_update'){if(currentIds.size>0&&!currentIds.has(msg.light_id)){return;}
-lights.set(msg.light_id,{state:msg.state,remain_ms:msg.remain_ms});render();}
-else if(msg.type==='subscribe_ack'){setStatus(`已订阅 ${msg.count||0} 个路口`);}
+if(msg.type==='stock_update'){if(currentCodes.size>0&&!currentCodes.has(msg.code)){return;}
+stocks.set(msg.code,{price:msg.price,change_pct:msg.change_pct,volume:msg.volume});render();}
+else if(msg.type==='subscribe_ack'){setStatus(`已订阅 ${msg.count||0} 只股票`);}
 else if(msg.type==='ready'){setStatus('连接成功，等待推送');}
 else if(msg.type==='error'){setStatus(`错误：${msg.message||'未知'}`);}}
 catch(err){console.error('bad message',err);}};
@@ -204,43 +264,39 @@ button {
   font-size: 16px;
   cursor: pointer;
 }
-.lights {
+.stocks {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 12px;
 }
-.light-card {
+.stock-card {
   border-radius: 8px;
   padding: 16px;
   background: #fff;
   box-shadow: 0 2px 6px rgba(0,0,0,0.08);
 }
-.light-card.red { border-left: 4px solid #ef5350; }
-.light-card.yellow { border-left: 4px solid #fdd835; }
-.light-card.green { border-left: 4px solid #66bb6a; }
-.light-id { font-weight: bold; margin-bottom: 8px; }
-.light-state { font-size: 20px; margin-bottom: 4px; }
+.stock-card.up { border-left: 4px solid #ef5350; }
+.stock-card.down { border-left: 4px solid #66bb6a; }
+.stock-code { font-weight: bold; margin-bottom: 8px; }
+.stock-price { font-size: 20px; margin-bottom: 4px; }
+.stock-change { font-size: 14px; margin-bottom: 4px; }
+.stock-change.up { color: #ef5350; }
+.stock-change.down { color: #66bb6a; }
+.stock-volume { font-size: 12px; color: #607d8b; }
 .status { margin: 8px 0; color: #607d8b; }
 )";
 constexpr char kEmptyFavicon[] = "";
 
-// SUBSCRIBE 管理：light_id -> 订阅该路口的连接（弱引用）
+// SUBSCRIBE 管理：stock_code -> 订阅该股票的连接（弱引用）
 class SubscriptionManager {
  public:
   using ConnectionPtr = std::shared_ptr<TcpConnection>;
 
-  // 更新某连接的订阅集合：new_ids 为完整新集合
+  // 更新某连接的订阅集合：new_codes 为完整新集合
   void UpdateSubscriptions(const ConnectionPtr& conn,
-                           const std::vector<uint32_t>& new_ids) {
-    Session* sess = conn->get_context<Session>();
-    if (!sess) {
-      return;
-    }
-
-    // 1. 从旧订阅中移除该连接
-    for (uint32_t id : sess->subscribed_light_ids) {
-      auto it = subs_.find(id);
-      if (it == subs_.end()) continue;
+                           const std::vector<std::string>& new_codes) {
+    // 从旧订阅中移除该连接
+    for (auto it = subs_.begin(); it != subs_.end();) {
       auto& vec = it->second;
       vec.erase(std::remove_if(vec.begin(), vec.end(),
                                [&](const std::weak_ptr<TcpConnection>& wp) {
@@ -249,24 +305,21 @@ class SubscriptionManager {
                                }),
                 vec.end());
       if (vec.empty()) {
-        subs_.erase(it);
+        it = subs_.erase(it);
+      } else {
+        ++it;
       }
     }
 
-    // 2. 记录新订阅并加入映射
-    sess->subscribed_light_ids = new_ids;
-    for (uint32_t id : sess->subscribed_light_ids) {
-      subs_[id].push_back(conn);
+    // 记录新订阅并加入映射
+    for (const auto& code : new_codes) {
+      subs_[code].push_back(conn);
     }
   }
 
   // 连接关闭时清理其所有订阅
   void RemoveConnection(const ConnectionPtr& conn) {
-    Session* sess = conn->get_context<Session>();
-    if (!sess) return;
-    for (uint32_t id : sess->subscribed_light_ids) {
-      auto it = subs_.find(id);
-      if (it == subs_.end()) continue;
+    for (auto it = subs_.begin(); it != subs_.end();) {
       auto& vec = it->second;
       vec.erase(std::remove_if(vec.begin(), vec.end(),
                                [&](const std::weak_ptr<TcpConnection>& wp) {
@@ -275,16 +328,17 @@ class SubscriptionManager {
                                }),
                 vec.end());
       if (vec.empty()) {
-        subs_.erase(it);
+        it = subs_.erase(it);
+      } else {
+        ++it;
       }
     }
-    sess->subscribed_light_ids.clear();
   }
 
-  // 遍历某个 light_id 的所有订阅连接；回调在调用者所在线程执行
+  // 遍历某个股票代码的所有订阅连接；回调在调用者所在线程执行
   template <typename F>
-  void ForEachSubscriber(uint32_t light_id, F&& f) {
-    auto it = subs_.find(light_id);
+  void ForEachSubscriber(const std::string& code, F&& f) {
+    auto it = subs_.find(code);
     if (it == subs_.end()) return;
     auto& vec = it->second;
     for (auto iter = vec.begin(); iter != vec.end();) {
@@ -301,57 +355,46 @@ class SubscriptionManager {
     }
   }
 
-  size_t LightCount() const { return subs_.size(); }
+  size_t StockCount() const { return subs_.size(); }
 
  private:
-  std::unordered_map<uint32_t, std::vector<std::weak_ptr<TcpConnection>>> subs_;
+  std::unordered_map<std::string, std::vector<std::weak_ptr<TcpConnection>>> subs_;
 };
 
-// 将 LightUpdate 转成发给 WebSocket 客户端的 JSON 文本
-std::string BuildLightUpdateJson(const LightUpdate& update) {
-  const char* state = "red";
-  if (update.state == 1) {
-    state = "yellow";
-  } else if (update.state == 2) {
-    state = "green";
-  }
-  std::string payload = "{\"type\":\"light_update\",\"light_id\":";
-  payload.append(std::to_string(update.light_id));
-  payload.append(",\"state\":\"");
-  payload.append(state);
-  payload.append("\",\"remain_ms\":");
-  payload.append(std::to_string(update.remain_ms));
+// 将 StockUpdate 转成发给 WebSocket 客户端的 JSON 文本
+std::string BuildStockUpdateJson(const StockUpdate& update) {
+  std::string payload = "{\"type\":\"stock_update\",\"code\":\"";
+  payload.append(update.code);
+  payload.append("\",\"price\":");
+  payload.append(std::to_string(update.price));
+  payload.append(",\"change_pct\":");
+  payload.append(std::to_string(update.change_pct));
+  payload.append(",\"volume\":");
+  payload.append(std::to_string(update.volume));
   payload.append("}");
   return payload;
 }
 
-// 红绿灯状态模拟器：独立线程生成状态变化，通过 EventLoop::QueueInLoop 投递
-class LightSimulator {
+// 股票行情模拟器：独立线程生成行情数据，通过 EventLoop::QueueInLoop 投递
+class StockSimulator {
  public:
-  using UpdateCallback = std::function<void(const LightUpdate&)>;
+  using UpdateCallback = std::function<void(const StockUpdate&)>;
 
-  LightSimulator(EventLoop* loop, uint32_t light_count, int tick_ms,
+  StockSimulator(EventLoop* loop, uint32_t stock_count, int tick_ms,
                  uint32_t updates_per_tick, UpdateCallback cb)
       : loop_(loop),
-        lights_(light_count),
+        stocks_(stock_count),
         tick_ms_(tick_ms),
         updates_per_tick_(updates_per_tick == 0 ? 1u : updates_per_tick),
         cb_(std::move(cb)) {
-    if (lights_.empty()) {
-      per_light_interval_ms_ = static_cast<uint32_t>(tick_ms_);
-    } else {
-      uint32_t stride = (lights_.size() + updates_per_tick_ - 1) / updates_per_tick_;
-      stride = std::max<uint32_t>(1, stride);
-      per_light_interval_ms_ = static_cast<uint32_t>(tick_ms_) * stride;
-    }
-    InitializeLights();
+    InitializeStocks();
   }
 
-  ~LightSimulator() { Stop(); }
+  ~StockSimulator() { Stop(); }
 
   void Start() {
     bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true)) return; // 防止重复启动
+    if (!running_.compare_exchange_strong(expected, true)) return;
     worker_ = std::thread([this]() { Run(); });
   }
 
@@ -364,23 +407,33 @@ class LightSimulator {
   }
 
  private:
-  struct LightState {
-    uint8_t state = 0;      // 0=红,1=黄,2=绿
-    uint32_t remain_ms = 0; // 当前状态剩余时间
+  struct StockState {
+    double price = 100.0;         // 初始价格
+    double change_pct = 0.0;      // 涨跌幅
+    uint64_t volume = 0;          // 成交量
+    std::string code;             // 股票代码
   };
 
+  void InitializeStocks() {
+    for (size_t i = 0; i < stocks_.size(); ++i) {
+      stocks_[i].code = "STOCK" + std::to_string(i + 1);
+      stocks_[i].price = 10.0 + (rng_() % 1000);  // 10-1010 随机初始价格
+      stocks_[i].change_pct = 0.0;
+      stocks_[i].volume = rng_() % 1000000;
+    }
+  }
+
   void Run() {
-    if (lights_.empty()) return;
+    if (stocks_.empty()) return;
     using Clock = std::chrono::steady_clock;
     const auto interval = std::chrono::milliseconds(tick_ms_);
     while (running_.load()) {
       auto start = Clock::now();
 
-      std::vector<LightUpdate> updates;
-      GenerateBatchUpdates(updates); // 生成一批更新
+      std::vector<StockUpdate> updates;
+      GenerateBatchUpdates(updates);
 
       if (!updates.empty()) {
-        // 将更新投递到 EventLoop 所在线程中执行回调，避免跨线程操作连接
         loop_->QueueInLoop([this, ups = std::move(updates)]() mutable {
           for (const auto& u : ups) {
             cb_(u);
@@ -389,85 +442,64 @@ class LightSimulator {
       }
 
       auto next = start + interval;
-       //sleep_for(100ms) 也能睡 100ms，但有累积误差：
-      std::this_thread::sleep_until(next);// 不睡的话，循环会全速跑,红绿灯不需要这么快——每 100ms 更新一批就够了
+      std::this_thread::sleep_until(next);
     }
   }
 
-  void GenerateBatchUpdates(std::vector<LightUpdate>& out) {
-    const uint32_t n = static_cast<uint32_t>(lights_.size());
+  void GenerateBatchUpdates(std::vector<StockUpdate>& out) {
+    const uint32_t n = static_cast<uint32_t>(stocks_.size());
     if (n == 0) return;
     out.clear();
     const uint32_t count = std::min(updates_per_tick_, n);
     out.reserve(count);
 
     for (uint32_t i = 0; i < count; ++i) {
-      uint32_t idx = next_light_;// 当前灯的下标
-      next_light_ = (next_light_ + 1) % n; // 移到下一盏
-      auto& st = lights_[idx];
-      if (st.remain_ms <= per_light_interval_ms_) {
-        st.state = static_cast<uint8_t>((st.state + 1) % 3);// 红→黄→绿→红
-        st.remain_ms = RandomDurationForState(st.state);// 随机新时长
-      } else {
-        st.remain_ms -= per_light_interval_ms_;
-      }
+      uint32_t idx = next_stock_;
+      next_stock_ = (next_stock_ + 1) % n;
+      auto& st = stocks_[idx];
 
-      LightUpdate u;
-      u.light_id = idx + 1;  // light_id 从 1 开始，避免 0
-      u.state = st.state;
-      u.remain_ms = st.remain_ms;
+      // 模拟价格波动 (-2% ~ +2%)
+      double change = (static_cast<double>(rng_() % 400) - 200.0) / 100.0;
+      st.price *= (1.0 + change / 100.0);
+      st.change_pct = change;
+      st.volume += rng_() % 10000;
+
+      StockUpdate u;
+      u.code = st.code;
+      u.price = st.price;
+      u.change_pct = st.change_pct;
+      u.volume = st.volume;
+      u.timestamp = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count());
       out.push_back(u);
     }
   }
 
-  EventLoop* loop_;// 主 EventLoop 指针（用来 QueueInLoop)
-  std::vector<LightState> lights_;// 1000 盏灯的状态
-  int tick_ms_ = 100;// 每 100ms 更新一批
-  uint32_t updates_per_tick_ = 100;// 每批更新 100 盏灯
-  UpdateCallback cb_;// 回调（就是 OnLightUpdate）
+  EventLoop* loop_;
+  std::vector<StockState> stocks_;
+  int tick_ms_ = 100;
+  uint32_t updates_per_tick_ = 10;
+  UpdateCallback cb_;
 
-  std::atomic<bool> running_{false}; // 运行标志
-  std::thread worker_;// 工作线程
-  uint32_t next_light_ = 0;// 下一盏要更新的灯（round-robin）
-  uint32_t per_light_interval_ms_ = 0; // 随机数生成器
+  std::atomic<bool> running_{false};
+  std::thread worker_;
+  uint32_t next_stock_ = 0;
   std::mt19937 rng_{std::random_device{}()};
-
-  void InitializeLights() {
-    for (auto& st : lights_) {
-      st.state = static_cast<uint8_t>(rng_() % 3);
-      st.remain_ms = RandomDurationForState(st.state);
-    }
-  }
-
-  uint32_t RandomDurationForState(uint8_t state) {
-    switch (state) {
-      case 0:  // red: 25-45s
-        return RandomRange(25000, 45000);
-      case 1:  // yellow: 3-5s
-        return RandomRange(3000, 5000);
-      case 2:  // green: 15-30s
-      default:
-        return RandomRange(15000, 30000);
-    }
-  }
-
-  uint32_t RandomRange(uint32_t min, uint32_t max) {
-    std::uniform_int_distribution<uint32_t> dist(min, max);
-    return dist(rng_);
-  }
 };
 
 // 主服务器对象
-class TrafficPushServer {
+class StockPushServer {
  public:
-  TrafficPushServer(EventLoop* base_loop, const InetAddress& listen_addr,
-                    int io_threads, uint32_t light_count, int tick_ms,
-                    uint32_t updates_per_tick, int http_port, int ws_port,
-                    std::string web_root)
+  StockPushServer(EventLoop* base_loop, const InetAddress& listen_addr,
+                  int io_threads, uint32_t stock_count, int tick_ms,
+                  uint32_t updates_per_tick, int http_port, int ws_port,
+                  std::string web_root)
       : base_loop_(base_loop),
         server_(base_loop, listen_addr, io_threads, /*reuse_port=*/false),
-        simulator_(base_loop, light_count, tick_ms, updates_per_tick,
-                   [this](const LightUpdate& u) { OnLightUpdate(u); }),
+        simulator_(base_loop, stock_count, tick_ms, updates_per_tick,
+                   [this](const StockUpdate& u) { OnStockUpdate(u); }),
         http_port_(http_port),
         ws_port_(ws_port),
         web_root_(std::move(web_root)) {
@@ -478,7 +510,7 @@ class TrafficPushServer {
           OnMessage(c, b);
         });
 
-    if (http_port_ > 0) { // 只有指定了 http 端口才创建
+    if (http_port_ > 0) {
       InetAddress http_addr(static_cast<uint16_t>(http_port_));
       http_server_ =
           std::make_unique<HttpServer>(base_loop_, http_addr, 1, false);
@@ -492,7 +524,7 @@ class TrafficPushServer {
   }
 
   void Start() {
-    LOG_INFO << "TrafficPushServer starting... http_port=" << http_port_
+    LOG_INFO << "StockPushServer starting... http_port=" << http_port_
              << " ws_port=" << ws_port_;
     if (http_server_) {
       http_server_->Start();
@@ -505,28 +537,25 @@ class TrafficPushServer {
   }
 
  private:
- //注册静态路由
   void ConfigureStaticHttp() {
     if (!http_server_) return;
     std::string ws_port_str = std::to_string(ws_port_);
 
-    //首页
     auto index = LoadWebAsset("index.html", kFallbackIndexHtml);
     index = ReplaceAllTokens(std::move(index), "{{WS_PORT}}", ws_port_str);
     http_server_->GetStatic("/", index, "text/html");
-    //注册 JS 脚本路由
+
     auto app_js = LoadWebAsset("app.js", kFallbackAppJs);
     app_js = ReplaceAllTokens(std::move(app_js), "{{WS_PORT}}", ws_port_str);
     http_server_->GetStatic("/app.js", app_js, "application/javascript");
-    //注册 CSS 样式路由
+
     auto style_css = LoadWebAsset("style.css", kFallbackStyleCss);
     http_server_->GetStatic("/style.css", style_css, "text/css");
 
-    //favicon.ico — 注册图标路由
     http_server_->GetStatic("/favicon.ico", LoadWebAsset("favicon.ico", kEmptyFavicon),
                             "image/x-icon");
   }
-  //读文件，读不到用内置兜底。就是"优先用磁盘文件，没有就用默认值
+
   std::string LoadWebAsset(const std::string& name,
                            const char* fallback) const {
     if (!web_root_.empty()) {
@@ -542,22 +571,18 @@ class TrafficPushServer {
     return std::string(fallback);
   }
 
-  // 新连接建立/关闭回调
   void OnConnection(const TcpServer::ConnectionPtr& conn) {
     if (conn->IsConnected()) {
-      // 新连接：初始化 Session
       Session sess;
       sess.last_heartbeat = std::chrono::steady_clock::now();
       conn->set_context(std::move(sess));
       LOG_INFO << "new connection fd=" << conn->fd();
     } else {
-      // 连接关闭：清理订阅
       LOG_INFO << "connection closed fd=" << conn->fd();
       subs_.RemoveConnection(conn);
     }
   }
 
-  // 消息到达回调：解析自定义协议
   void OnMessage(const TcpServer::ConnectionPtr& conn, Buffer* buf) {
     while (buf->readable_bytes() >= sizeof(uint32_t) + sizeof(uint16_t)) {
       const char* data = buf->peek();
@@ -565,18 +590,16 @@ class TrafficPushServer {
       std::memcpy(&total_len_n, data, sizeof(total_len_n));
       uint32_t total_len = ntohl(total_len_n);
       if (total_len < sizeof(uint32_t) + sizeof(uint16_t)) {
-        // 非法长度，直接关闭
         LOG_WARN << "invalid packet length=" << total_len << " fd=" << conn->fd();
         conn->Shutdown();
         return;
       }
       if (buf->readable_bytes() < total_len) {
-        // 粘包不完整，等待更多数据
         break;
       }
       uint16_t type_n = 0;
       std::memcpy(&type_n, data + sizeof(uint32_t), sizeof(type_n));
-      uint16_t type_v = ntohs(type_n); // 消息类型
+      uint16_t type_v = ntohs(type_n);
       MsgType type = static_cast<MsgType>(type_v);
 
       const char* body = data + sizeof(uint32_t) + sizeof(uint16_t);
@@ -593,7 +616,6 @@ class TrafficPushServer {
           HandlePing(conn);
           break;
         default:
-          // 其他类型（包括 kPong/kLightUpdate）客户端一般不会发，忽略或关闭
           LOG_WARN << "unknown msg type=" << type_v << " fd=" << conn->fd();
           break;
       }
@@ -604,29 +626,19 @@ class TrafficPushServer {
 
   void HandleLogin(const TcpServer::ConnectionPtr& conn, const char* body,
                    size_t len) {
-    /*
-      LOGIN 消息的 body 格式：
-      +----------+-----------+
-      | id_len   | user_id   |
-      |  2字节    | 变长字符串  |
-      +----------+-----------+
-    */
-    // 第一步：检查 body 够不够
-    if (len < sizeof(uint16_t)) {// 至少要有 2 字节存 id_len
+    if (len < sizeof(uint16_t)) {
       LOG_WARN << "LOGIN body too short fd=" << conn->fd();
       return;
     }
-    //第二步：读 user_id
     uint16_t id_len_n = 0;
     std::memcpy(&id_len_n, body, sizeof(id_len_n));
-    uint16_t id_len = ntohs(id_len_n);// 用户名长度
-    if (len < sizeof(uint16_t) + id_len) {// body 不够长，非法
+    uint16_t id_len = ntohs(id_len_n);
+    if (len < sizeof(uint16_t) + id_len) {
       LOG_WARN << "LOGIN body invalid length fd=" << conn->fd();
       return;
     }
     std::string user_id(body + sizeof(uint16_t),
-                        body + sizeof(uint16_t) + id_len);// 从 body 第3字节开始取 id_len 个字符
-    //第三步：写进 Session
+                        body + sizeof(uint16_t) + id_len);
     Session* sess = conn->get_context<Session>();
     if (!sess) {
       Session tmp;
@@ -634,51 +646,44 @@ class TrafficPushServer {
       tmp.last_heartbeat = std::chrono::steady_clock::now();
       conn->set_context(std::move(tmp));
     } else {
-      sess->user_id = std::move(user_id);// 写入用户名
-      sess->last_heartbeat = std::chrono::steady_clock::now();// 更新心跳时间
+      sess->user_id = std::move(user_id);
+      sess->last_heartbeat = std::chrono::steady_clock::now();
     }
     LOG_INFO << "LOGIN fd=" << conn->fd() << " user=" << (sess ? sess->user_id : "");
   }
 
   void HandleSubscribe(const TcpServer::ConnectionPtr& conn, const char* body,
                        size_t len) {
-    /*
-        SUBSCRIBE 消息的 body 格式：
-        +-------+------+------+------+
-        | count | id1  | id2  | id3  |
-        | 2字节  | 4字节 | 4字节 | 4字节 |
-        +-------+------+------+------+
-        */
-    // 第一步：检查 body 够不够
     if (len < sizeof(uint16_t)) {
       LOG_WARN << "SUBSCRIBE body too short fd=" << conn->fd();
       return;
     }
-    //第二步：读 count，算预期长度
     uint16_t cnt_n = 0;
     std::memcpy(&cnt_n, body, sizeof(cnt_n));
     uint16_t cnt = ntohs(cnt_n);
-    size_t expected = sizeof(uint16_t) + static_cast<size_t>(cnt) * sizeof(uint32_t);
-    if (len < expected) {
-      LOG_WARN << "SUBSCRIBE body invalid length fd=" << conn->fd()
-               << " len=" << len << " expected=" << expected;
-      return;
-    }
-    //第三步：逐个读灯 ID
-    std::vector<uint32_t> ids;
-    ids.reserve(cnt);
+
+    std::vector<std::string> codes;
     const char* p = body + sizeof(uint16_t);
+    size_t remaining = len - sizeof(uint16_t);
+
     for (uint16_t i = 0; i < cnt; ++i) {
-      uint32_t id_n = 0;
-      std::memcpy(&id_n, p, sizeof(id_n));
-      p += sizeof(id_n);
-      ids.push_back(ntohl(id_n));
+      if (remaining < sizeof(uint16_t)) break;
+      uint16_t code_len_n = 0;
+      std::memcpy(&code_len_n, p, sizeof(code_len_n));
+      uint16_t code_len = ntohs(code_len_n);
+      p += sizeof(uint16_t);
+      remaining -= sizeof(uint16_t);
+
+      if (remaining < code_len) break;
+      codes.emplace_back(p, code_len);
+      p += code_len;
+      remaining -= code_len;
     }
-    // 第四步：更新订阅表
-    subs_.UpdateSubscriptions(conn, ids);
+
+    subs_.UpdateSubscriptions(conn, codes);
     Session* sess = conn->get_context<Session>();
     LOG_INFO << "SUBSCRIBE fd=" << conn->fd() << " user="
-             << (sess ? sess->user_id : "") << " count=" << ids.size();
+             << (sess ? sess->user_id : "") << " count=" << codes.size();
   }
 
   void HandlePing(const TcpServer::ConnectionPtr& conn) {
@@ -690,48 +695,65 @@ class TrafficPushServer {
     conn->Send(kPongPacket);
   }
 
-  // 红绿灯更新事件：在 EventLoop 线程中调用
-  void OnLightUpdate(const LightUpdate& u) {
-    //第一部分：构造二进制包（给 C 客户端）
-    char body[sizeof(uint32_t) + 1 + sizeof(uint32_t)];// 4+1+4 = 9 字节
-    uint32_t id_n = htonl(u.light_id);// 灯ID，转网络字节序
-    std::memcpy(body, &id_n, sizeof(id_n));// 写到 body[0..3]
-    body[sizeof(uint32_t)] = static_cast<char>(u.state); // 状态(0红/1黄/2绿)，1字节直接写
-    uint32_t remain_n = htonl(u.remain_ms); // 剩余时间，转网络字节序
-    std::memcpy(body + sizeof(uint32_t) + 1, &remain_n, sizeof(remain_n));// 写到 body[5..8]
-    //然后打包成完整协议包：
-    std::string packet = MakePacket(MsgType::kLightUpdate, body, sizeof(body));
-// 第二部分：推给 C 客户端（TcpServer :9000）
-    subs_.ForEachSubscriber(//ForEachSubscriber 不只是"遍历"，是"遍历 + 自动清理"。
-      /*遍历订阅了这盏灯的所有连接，逐个发送
-      packet 用引用捕获，多个连接共享同一份数据，不重复拷贝*/
-        u.light_id, [&packet](const std::shared_ptr<TcpConnection>& c) {
-          c->Send(packet);
-        });
-//第三部分：推给 Web 浏览器（WebSocketServer :9100）
+  void OnStockUpdate(const StockUpdate& u) {
+    // 构造二进制包
+    std::string body;
+    uint16_t code_len = static_cast<uint16_t>(u.code.size());
+    uint16_t code_len_n = htons(code_len);
+    body.append(reinterpret_cast<const char*>(&code_len_n), sizeof(code_len_n));
+    body.append(u.code);
+
+    double price = u.price;
+    double change_pct = u.change_pct;
+    uint64_t volume = u.volume;
+    uint64_t timestamp = u.timestamp;
+
+    body.append(reinterpret_cast<const char*>(&price), sizeof(price));
+    body.append(reinterpret_cast<const char*>(&change_pct), sizeof(change_pct));
+    body.append(reinterpret_cast<const char*>(&volume), sizeof(volume));
+    body.append(reinterpret_cast<const char*>(&timestamp), sizeof(timestamp));
+
+    std::string packet = MakePacket(MsgType::kStockUpdate, body.data(), body.size());
+
+    // 推给 TCP 客户端
+    subs_.ForEachSubscriber(u.code, [&packet](const std::shared_ptr<TcpConnection>& c) {
+      c->Send(packet);
+    });
+
+    // 推给 WebSocket 客户端
     if (ws_server_) {
-      std::string json = BuildLightUpdateJson(u);
-      ws_server_->PublishTo(u.light_id, json);
+      uint32_t id = 0;
+      auto it = code_to_id_.find(u.code);
+      if (it != code_to_id_.end()) {
+        id = it->second;
+      } else {
+        id = next_id_++;
+        code_to_id_[u.code] = id;
+      }
+      std::string json = BuildStockUpdateJson(u);
+      ws_server_->PublishTo(id, json);
     }
   }
 
   EventLoop* base_loop_;
   TcpServer server_;
   SubscriptionManager subs_;
-  LightSimulator simulator_;
+  StockSimulator simulator_;
   int http_port_ = 0;
   int ws_port_ = 0;
   std::string web_root_;
   std::unique_ptr<HttpServer> http_server_;
   std::unique_ptr<WebSocketServer> ws_server_;
+  std::unordered_map<std::string, uint32_t> code_to_id_;
+  uint32_t next_id_ = 1;
 };
 
 struct ServerOptions {
   int port = 9000;
   int io_threads = 1;
-  uint32_t light_count = 1000;
+  uint32_t stock_count = 100;
   int tick_ms = 100;
-  uint32_t updates_per_tick = 100;
+  uint32_t updates_per_tick = 10;
   int http_port = 9200;
   int ws_port = 9100;
   std::string web_root = "netx/web";
@@ -739,12 +761,12 @@ struct ServerOptions {
 
 void PrintUsage(const char* prog) {
   std::cout << "Usage: " << prog
-            << " [--port <port>] [--io-threads <n>] [--lights <count>]\n"
+            << " [--port <port>] [--io-threads <n>] [--stocks <count>]\n"
                "           [--tick-ms <ms>] [--updates-per-tick <n>]\n"
                "           [--http-port <port>] [--ws-port <port>]\n"
                "           [--web-root <dir>]\n"
-               "\nDefault: port=9000, io-threads=1, lights=1000, tick-ms=100, "
-               "updates-per-tick=100, http-port=8080, ws-port=9100\n";
+               "\nDefault: port=9000, io-threads=1, stocks=100, tick-ms=100, "
+               "updates-per-tick=10, http-port=9200, ws-port=9100\n";
 }
 
 bool ParseArgs(int argc, char* argv[], ServerOptions* opts) {
@@ -769,8 +791,8 @@ bool ParseArgs(int argc, char* argv[], ServerOptions* opts) {
       if (!next(opts->port)) return false;
     } else if (arg == "--io-threads") {
       if (!next(opts->io_threads)) return false;
-    } else if (arg == "--lights") {
-      if (!next_u32(opts->light_count)) return false;
+    } else if (arg == "--stocks") {
+      if (!next_u32(opts->stock_count)) return false;
     } else if (arg == "--tick-ms") {
       if (!next(opts->tick_ms)) return false;
     } else if (arg == "--updates-per-tick") {
@@ -801,9 +823,9 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  LOG_INFO << "TrafficPushServer config: port=" << opts.port
+  LOG_INFO << "StockPushServer config: port=" << opts.port
            << " io_threads=" << opts.io_threads
-           << " lights=" << opts.light_count
+           << " stocks=" << opts.stock_count
            << " tick_ms=" << opts.tick_ms
            << " updates_per_tick=" << opts.updates_per_tick
            << " http_port=" << opts.http_port
@@ -812,14 +834,10 @@ int main(int argc, char* argv[]) {
 
   EventLoop loop(/*single_thread_mode=*/opts.io_threads == 1);
   InetAddress addr(static_cast<uint16_t>(opts.port));
-  TrafficPushServer server(&loop, addr, opts.io_threads, opts.light_count,
+  StockPushServer server(&loop, addr, opts.io_threads, opts.stock_count,
                            opts.tick_ms, opts.updates_per_tick,
                            opts.http_port, opts.ws_port, opts.web_root);
   server.Start();
   loop.Loop();
   return 0;
 }
-
-
-
-

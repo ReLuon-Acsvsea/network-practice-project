@@ -1,3 +1,4 @@
+// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_SOCKET_H_
 #define NETX_SOCKET_H_
 
@@ -7,28 +8,33 @@ namespace netx {
 
 class InetAddress;
 
-class Socket{
-  private:
-    int fd_;
-  public:
-    explicit Socket(int fd);
-    ~Socket();
+// Socket 封装 TCP 套接字常用操作，负责 fd 生命周期管理与选项设置
+class Socket {
+ public:
+  explicit Socket(int fd);
+  ~Socket();
 
-    Socket(const Socket &) =delete;
-    Socket& operator=(const Socket&) = delete;
+  Socket(const Socket&) = delete;
+  Socket& operator=(const Socket&) = delete;
 
-    int fd() const { return fd_;}
-    static int CreateNonblocking();
-    static int CreateNonblockingReusePort();
+  int fd() const { return fd_; }
 
-    void Bind(const InetAddress &addr);
-    void Listen(int backlog = 1024);
-    int Accept(InetAddress * peer);
+  static int CreateNonblocking();
+  static int CreateNonblockingReusePort();
 
-    void SetReuseAddr(bool on);
-    void SetReusePort(bool on);
+  void Bind(const InetAddress& addr);
+  void Listen(int backlog = 4096);
+  int Accept(InetAddress* peer);
 
+  void SetReuseAddr(bool on);
+  void SetReusePort(bool on);
+
+ private:
+  int fd_;
 };
 
-}
-#endif
+}  // namespace netx
+
+#endif  // NETX_SOCKET_H_
+
+

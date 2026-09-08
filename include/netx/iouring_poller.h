@@ -1,7 +1,10 @@
+// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_IOURING_POLLER_H_
 #define NETX_IOURING_POLLER_H_
 
 #include <sys/epoll.h>
+
+#include "netx/epoll_poller.h"  // WSL2 等环境下的回退实现
 
 #if defined(NETX_USE_IOURING)
 #include <liburing.h>
@@ -12,8 +15,6 @@
 #include <vector>
 #else
 #include <vector>
-
-#include "netx/epoll_poller.h"  // fallback implementation
 #endif
 
 namespace netx {
@@ -63,6 +64,8 @@ class IoUringPoller {
   std::unordered_map<uint32_t, Watcher*> id_index_;
   std::vector<epoll_event> ready_events_;
   uint32_t next_id_{1};
+  bool use_epoll_fallback_{false};  // WSL2 等环境下 io_uring 对 TCP 不支持时回退
+  EpollPoller fallback_;            // 回退用的 epoll poller
 };
 
 #else

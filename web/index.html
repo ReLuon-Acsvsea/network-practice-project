@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>红绿灯推送系统Web演示</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>红绿灯推送系统Web演示</h1>
+        <p class="subtitle">基于 epoll 的实时红绿灯推送</p>
+      </header>
+      <section class="panel">
+        <p class="status" id="status">正在连接...</p>
+        <div class="control-grid">
+          <div>
+            <label for="light-input">订阅红绿灯 ID（逗号分隔）</label>
+            <input id="light-input" value="1,2,3" />
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="subscribe-btn">更新订阅</button>
+          </div>
+        </div>
+      </section>
+      <section>
+        <h2>实时状态</h2>
+        <div id="lights" class="lights"></div>
+      </section>
+    </div>
+    <script>
+      window.__WS_PORT__ = {{WS_PORT}};
+    </script>
+    <script src="/app.js"></script>
+  </body>
+</html>
+
