@@ -47,6 +47,8 @@ void TcpConnection::HandleRead() {
   ssize_t n = input_.read_fd(fd(), &saved);
   LOG_DEBUG << "conn fd=" << fd() << " read n=" << n << " errno=" << saved;
   if (n > 0) {
+    // 收到数据，重置超时定时器
+    ResetTimeout();
     auto self = shared_from_this();
     // 优先使用轻量级函数指针回调，避免经过 std::function
     if (raw_msg_fn_) {
@@ -93,6 +95,12 @@ void TcpConnection::HandleClose() {
   state_ = State::kDisconnected;
   channel_->remove();
   writing_ = false;
+  // 清理定时器
+  ClearTimeout();
+  if (heartbeat_timer_id_ > 0) {
+    loop_->CancelTimer(heartbeat_timer_id_);
+    heartbeat_timer_id_ = 0;
+  }
   auto self = shared_from_this();
   if (raw_close_fn_) {
     raw_close_fn_(raw_close_ctx_, self);
@@ -291,5 +299,60 @@ void TcpConnection::SendVecInLoop(const char *data1, size_t len1,
 
 // 关闭写端：触发 FIN 包
 void TcpConnection::Shutdown() { ::shutdown(fd(), SHUT_WR); }
+
+// 设置连接超时：超时后自动关闭连接
+void TcpConnection::SetTimeout(uint64_t timeout_ms) {
+  timeout_ms_ = timeout_ms;
+  if (timeout_ms > 0) {
+    ResetTimeout();
+  } else {
+    ClearTimeout();
+  }
+}
+
+// 重置超时定时器：收到数据时调用，重新开始计时
+void TcpConnection::ResetTimeout() {
+  if (timeout_ms_ == 0) return;
+
+  // 取消旧定时器
+  if (timeout_timer_id_ > 0) {
+    loop_->CancelTimer(timeout_timer_id_);
+  }
+
+  // 创建新定时器
+  auto self = shared_from_this();
+  timeout_timer_id_ = loop_->RunAfter(timeout_ms_, [self]() {
+    LOG_INFO << "Connection timeout fd=" << self->fd();
+    self->Shutdown();
+  });
+}
+
+// 清除超时定时器：连接关闭时调用
+void TcpConnection::ClearTimeout() {
+  if (timeout_timer_id_ > 0) {
+    loop_->CancelTimer(timeout_timer_id_);
+    timeout_timer_id_ = 0;
+  }
+}
+
+// 设置心跳检测间隔：定期检查连接是否存活
+void TcpConnection::SetHeartbeatInterval(uint64_t interval_ms) {
+  // 清除旧定时器
+  if (heartbeat_timer_id_ > 0) {
+    loop_->CancelTimer(heartbeat_timer_id_);
+    heartbeat_timer_id_ = 0;
+  }
+
+  if (interval_ms > 0) {
+    // 创建重复定时器
+    auto self = shared_from_this();
+    heartbeat_timer_id_ = loop_->RunEvery(interval_ms, [self]() {
+      // 心跳检测：这里只是示例，实际应用中可以检查连接状态
+      if (!self->IsConnected()) {
+        self->ClearTimeout();
+      }
+    });
+  }
+}
 
 } // namespace netx

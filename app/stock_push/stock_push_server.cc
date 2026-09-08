@@ -534,9 +534,52 @@ class StockPushServer {
     }
     simulator_.Start();
     server_.Start();
+    // 启动心跳检测：每 30 秒检查一次，超时时间 60 秒
+    StartHeartbeatCheck(30000, 60000);
   }
 
  private:
+  // 启动心跳检测
+  void StartHeartbeatCheck(uint64_t check_interval_ms, uint64_t timeout_ms) {
+    heartbeat_timeout_ms_ = timeout_ms;
+    base_loop_->RunEvery(check_interval_ms, [this]() {
+      CheckHeartbeats();
+    });
+    LOG_INFO << "Heartbeat check started: interval=" << check_interval_ms
+             << "ms timeout=" << timeout_ms << "ms";
+  }
+
+  // 检查所有连接的心跳
+  void CheckHeartbeats() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<TcpServer::ConnectionPtr> timeout_conns;
+
+    // 遍历所有连接，检查心跳时间
+    server_.ForEachConnection([&](const TcpServer::ConnectionPtr& conn) {
+      Session* sess = conn->get_context<Session>();
+      if (!sess) return;
+
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - sess->last_heartbeat).count();
+      if (static_cast<uint64_t>(elapsed) > heartbeat_timeout_ms_) {
+        timeout_conns.push_back(conn);
+      }
+    });
+
+    // 关闭超时连接
+    for (auto& conn : timeout_conns) {
+      Session* sess = conn->get_context<Session>();
+      LOG_INFO << "Heartbeat timeout fd=" << conn->fd()
+               << " user=" << (sess ? sess->user_id : "unknown");
+      conn->Shutdown();
+      subs_.RemoveConnection(conn);
+    }
+
+    if (!timeout_conns.empty()) {
+      LOG_INFO << "Closed " << timeout_conns.size() << " timeout connections";
+    }
+  }
+
   void ConfigureStaticHttp() {
     if (!http_server_) return;
     std::string ws_port_str = std::to_string(ws_port_);
@@ -746,6 +789,7 @@ class StockPushServer {
   std::unique_ptr<WebSocketServer> ws_server_;
   std::unordered_map<std::string, uint32_t> code_to_id_;
   uint32_t next_id_ = 1;
+  uint64_t heartbeat_timeout_ms_ = 60000; // 心跳超时时间（毫秒）
 };
 
 struct ServerOptions {

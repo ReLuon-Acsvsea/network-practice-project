@@ -33,8 +33,17 @@ class TcpServer {
   void SetConnectionCallback(ConnectionCallback cb) { connection_cb_ = std::move(cb); }
   void SetMessageCallback(MessageCallback cb) { message_cb_ = std::move(cb); }
 
+  // 设置连接超时：新连接创建后，如果在 timeout_ms 内没有数据，自动关闭
+  // timeout_ms: 超时时间（毫秒），0 表示不超时
+  void SetConnectionTimeout(uint64_t timeout_ms) { connection_timeout_ms_ = timeout_ms; }
+
   // 内部辅助：供轻量回调包装调用，转发到私有 RemoveConnection
   void RemoveConnectionInternal(const ConnectionPtr& conn);
+
+  // 遍历所有连接：用于心跳检测等场景
+  // callback: 回调函数，参数为 ConnectionPtr
+  using ConnectionVisitor = std::function<void(const ConnectionPtr&)>;
+  void ForEachConnection(ConnectionVisitor callback);
 
   void Start();
 
@@ -53,6 +62,9 @@ class TcpServer {
 
   // 每个 IO 线程独立维护自己的连接表，数据面不跨线程共享
   std::unordered_map<EventLoop*, std::unordered_map<int, ConnectionPtr>> loop_conns_;
+
+  // 连接超时时间（毫秒），0 表示不超时
+  uint64_t connection_timeout_ms_ = 0;
 
 };
 

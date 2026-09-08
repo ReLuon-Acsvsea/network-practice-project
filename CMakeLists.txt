@@ -105,6 +105,9 @@ if(NETX_BUILD_EXAMPLES)
 
   add_executable(timer_test examples/timer_test.cc)
   target_link_libraries(timer_test PRIVATE netx)
+
+  add_executable(connection_timeout_test examples/connection_timeout_test.cc)
+  target_link_libraries(connection_timeout_test PRIVATE netx)
 endif()
 
 # ============================================================

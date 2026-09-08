@@ -95,6 +95,22 @@ public:
   //   shared_from_this 保护"回调执行期间对象不被销毁"
   void Tie(const std::shared_ptr<TcpConnection>& self);
 
+  // ===== 定时器相关接口 =====
+
+  // 设置连接超时：超时后自动关闭连接
+  // timeout_ms: 超时时间（毫秒），0 表示不超时
+  void SetTimeout(uint64_t timeout_ms);
+
+  // 重置超时定时器：收到数据时调用，重新开始计时
+  void ResetTimeout();
+
+  // 清除超时定时器：连接关闭时调用
+  void ClearTimeout();
+
+  // 设置心跳检测间隔：定期检查连接是否存活
+  // interval_ms: 心跳间隔（毫秒），0 表示不检测
+  void SetHeartbeatInterval(uint64_t interval_ms);
+
 private:
   // Channel 回调：epoll 事件驱动调用
   void HandleRead();   // EPOLLIN → read_fd 到 input_ → 回调上层
@@ -137,6 +153,14 @@ private:
   //   没数据要发 → false，不关注（否则 EPOLLOUT 空转浪费 CPU）
   //   有数据没发完 → true，关注 EPOLLOUT，等可写时 HandleWrite 继续发
   bool writing_ = false;
+
+  // ===== 定时器相关成员 =====
+  // 超时定时器 ID（0 表示未设置）
+  uint64_t timeout_timer_id_ = 0;
+  // 超时时间（毫秒）
+  uint64_t timeout_ms_ = 0;
+  // 心跳检测定时器 ID（0 表示未设置）
+  uint64_t heartbeat_timer_id_ = 0;
 };
 
 } // namespace netx

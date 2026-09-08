@@ -90,6 +90,10 @@ void TcpServer::NewConnectionInLoop(EventLoop* io, int fd, const InetAddress& /*
     // 内部使用轻量级函数指针回调，避免为每个连接构造 std::function lambda
     conn->set_raw_message_handler(this, &TcpServerMessageDispatch);// 注册回调
     conn->set_raw_close_handler(this, &TcpServerCloseDispatch);
+    // 设置连接超时
+    if (connection_timeout_ms_ > 0) {
+      conn->SetTimeout(connection_timeout_ms_);
+    }
     // 仅在所属 IO 线程的本地连接表中登记
     loop_conns_.at(io).emplace(conn->fd(), conn);// map 持有 → 引用计数 = 2
     if (connection_cb_) connection_cb_(conn);
@@ -113,6 +117,17 @@ void TcpServer::RemoveConnection(const ConnectionPtr& conn) {
     }
     if (connection_cb_) connection_cb_(conn);
   });
+}
+
+// 遍历所有连接
+void TcpServer::ForEachConnection(ConnectionVisitor callback) {
+  for (auto& [loop, conns] : loop_conns_) {
+    for (auto& [fd, conn] : conns) {
+      if (conn->IsConnected()) {
+        callback(conn);
+      }
+    }
+  }
 }
 
 }  // namespace netx
