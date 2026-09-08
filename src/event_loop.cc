@@ -2,6 +2,7 @@
 
 #include "netx/channel.h"
 
+#include <chrono>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <thread>
@@ -30,7 +31,8 @@ EventLoop::EventLoop(bool /*single_thread_mode*/)
     : wakeup_fd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
       wakeup_channel_(nullptr),
       // events_(),
-      tid_(Tid()) {
+      tid_(Tid()),
+      timer_wheel_(this) {
   wakeup_channel_ = new Channel(this, wakeup_fd_);
   wakeup_channel_->set_read_callback([this]() { HandleWakeup(); });
   wakeup_channel_->enable_reading();
@@ -64,8 +66,18 @@ void EventLoop::Loop() {
       std::lock_guard<std::mutex> lk(pending_mu_);
       empty = pending_tasks_.empty();//检查队列里有没有任务
     }
-    // 空队列时阻塞等待事件（-1）。若未来加入定时器，将以最早到期时间作为超时值或使用 timerfd 唤醒。
+
+    // 计算超时时间：考虑定时器
     int timeout_ms = empty ? -1 : 0;
+    if (empty) {
+      // 获取最近的定时器超时时间
+      int64_t timer_timeout = timer_wheel_.GetNextTimeout();
+      if (timer_timeout >= 0) {
+        // 使用定时器超时时间（最小 1ms，避免忙等）
+        timeout_ms = static_cast<int>(std::max(static_cast<int64_t>(1), timer_timeout));
+      }
+    }
+
     const epoll_event* evs = nullptr;
     int n = poller_.Poll(timeout_ms, &evs);
     for (int i = 0; i < n; ++i) {
@@ -74,6 +86,10 @@ void EventLoop::Loop() {
       ch->set_revents(ev.events);
       ch->handle_event();
     }
+
+    // 处理定时器
+    ProcessTimers();
+
     DoPendingTasks();//执行任务队列
   }
 }
@@ -171,6 +187,30 @@ void EventLoop::DoPendingTasks() {
   }
   pending_buffer_.clear(); // clear content but keep capacity
   calling_pending_ = false;
+}
+
+// 添加延迟定时器
+EventLoop::TimerId EventLoop::RunAfter(uint64_t delay_ms, Task cb) {
+  return timer_wheel_.AddTimer(delay_ms, std::move(cb), false);
+}
+
+// 添加重复定时器
+EventLoop::TimerId EventLoop::RunEvery(uint64_t interval_ms, Task cb) {
+  return timer_wheel_.AddRepeatTimer(interval_ms, std::move(cb));
+}
+
+// 取消定时器
+void EventLoop::CancelTimer(TimerId timer_id) {
+  timer_wheel_.RemoveTimer(timer_id);
+}
+
+// 处理定时器
+void EventLoop::ProcessTimers() {
+  // 获取当前时间（毫秒）
+  auto now = std::chrono::steady_clock::now();
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch()).count();
+  timer_wheel_.Tick(static_cast<uint64_t>(ms));
 }
 
 } // namespace netx

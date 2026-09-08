@@ -44,6 +44,8 @@ add_library(netx STATIC
     src/http_parser.cc
     src/http_server.cc
     src/websocket_server.cc
+    src/timer.cc
+    src/timer_wheel.cc
 )
 
 # 头文件路径（PUBLIC = 使用 netx 的目标自动继承此 include 路径）
@@ -100,6 +102,9 @@ if(NETX_BUILD_EXAMPLES)
 
   add_executable(logging_bench examples/logging_bench.cc)
   target_link_libraries(logging_bench PRIVATE netx)
+
+  add_executable(timer_test examples/timer_test.cc)
+  target_link_libraries(timer_test PRIVATE netx)
 endif()
 
 # ============================================================

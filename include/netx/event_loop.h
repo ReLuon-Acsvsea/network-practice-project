@@ -1,6 +1,8 @@
 #ifndef NETX_EVENT_LOOP_H_
 #define NETX_EVENT_LOOP_H_
 
+#include "netx/timer_wheel.h"
+
 #include <atomic>
 #include <functional>
 #include <vector>
@@ -25,6 +27,8 @@ class EventLoop {
  public:
   // Loop 内部任务类型（可被投递到 EventLoop 执行）
   using Task = std::function<void()>;
+  // 定时器 ID 类型
+  using TimerId = TimerWheel::TimerId;
 
   // single_thread_mode: true = 单线程模式（无原子操作，性能更好）
   //                    false = 多线程模式（使用原子操作，线程安全）
@@ -49,6 +53,16 @@ class EventLoop {
   // 从 Poller 与内部结构中移除 Channel
   void RemoveChannel(Channel* ch);
 
+  // 定时器接口
+  // 添加延迟定时器：delay_ms 毫秒后执行 cb
+  // 返回：定时器 ID，可用于取消定时器
+  TimerId RunAfter(uint64_t delay_ms, Task cb);
+  // 添加重复定时器：每 interval_ms 毫秒执行 cb
+  // 返回：定时器 ID
+  TimerId RunEvery(uint64_t interval_ms, Task cb);
+  // 取消定时器
+  void CancelTimer(TimerId timer_id);
+
   // 判断当前调用线程是否为 EventLoop 所属线程
   bool IsInLoopThread() const;
 
@@ -59,6 +73,8 @@ class EventLoop {
   void HandleWakeup();
   // 执行挂起任务队列中的所有任务
   void DoPendingTasks();
+  // 处理定时器
+  void ProcessTimers();
 
   // 用于跨线程唤醒 EventLoop 的 eventfd
   int wakeup_fd_;
@@ -86,6 +102,9 @@ class EventLoop {
   bool quit_{false};
   // EventLoop 所属线程的 tid（用于 IsInLoopThread 判断）
   const unsigned long tid_;
+
+  // 定时器系统
+  TimerWheel timer_wheel_;
 };
 
 }  // namespace netx
