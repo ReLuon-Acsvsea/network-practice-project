@@ -1,4 +1,3 @@
-// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_ACCEPTOR_H_
 #define NETX_ACCEPTOR_H_
 

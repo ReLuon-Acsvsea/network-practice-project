@@ -8,6 +8,7 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 #include "netx/buffer.h"
@@ -31,7 +32,7 @@ namespace netx
         {
             std::string action;
             std::string user_id;
-            std::vector<uint32_t> lights;
+            std::vector<std::string> lights;
         };
 
         // JSON 字符串转义（把 " 和 \ 前面加反斜杠）
@@ -338,8 +339,8 @@ namespace netx
         }
 
         // 从 JSON 中提取 uint 数组字段，如 "lights":[1,2,3] → {1,2,3}
-        bool ExtractUintArrayField(std::string_view json, std::string_view key,
-                                   std::vector<uint32_t> *out)
+        bool ExtractStringArrayField(std::string_view json, std::string_view key,
+                                    std::vector<std::string> *out)
         {
             std::string pattern = "\"" + std::string(key) + "\"";
             size_t pos = json.find(pattern);
@@ -372,16 +373,19 @@ namespace netx
                     ++pos;
                     return true;
                 }
+                // 解析字符串 "..."
+                if (json[pos] != '"')
+                    return false;
+                ++pos;  // skip opening quote
                 size_t start = pos;
-                while (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos])))
+                while (pos < json.size() && json[pos] != '"')
                 {
                     ++pos;
                 }
-                if (start == pos)
+                if (pos >= json.size())
                     return false;
-                uint32_t v = static_cast<uint32_t>(std::strtoul(
-                    std::string(json.substr(start, pos - start)).c_str(), nullptr, 10));
-                out->push_back(v);
+                out->emplace_back(json.substr(start, pos - start));
+                ++pos;  // skip closing quote
                 while (pos < json.size() &&
                        std::isspace(static_cast<unsigned char>(json[pos])))
                 {
@@ -407,7 +411,7 @@ namespace netx
                 return false;
             }
             ExtractStringField(payload, "user_id", &cmd->user_id);
-            ExtractUintArrayField(payload, "lights", &cmd->lights);
+            ExtractStringArrayField(payload, "lights", &cmd->lights);
             return true;
         }
 
@@ -726,17 +730,19 @@ namespace netx
 
     void WebSocketServer::UpdateSubscriptions(const ConnectionPtr &conn,
                                               Session *sess,
-                                              const std::vector<uint32_t> &new_ids)
+                                              const std::vector<std::string> &new_ids)
     {
-        std::vector<uint32_t> normalized = new_ids;
-        normalized.erase(std::remove(normalized.begin(), normalized.end(), 0),
-                         normalized.end());
-        std::sort(normalized.begin(), normalized.end());
-        normalized.erase(std::unique(normalized.begin(), normalized.end()),
-                         normalized.end());
+        std::vector<std::string> normalized;
+        // 去重
+        std::unordered_set<std::string> seen;
+        for (const auto& id : new_ids) {
+            if (!id.empty() && seen.insert(id).second) {
+                normalized.push_back(id);
+            }
+        }
         {
             std::lock_guard<std::mutex> lk(subs_mu_);
-            for (uint32_t id : sess->subscribed)
+            for (const auto& id : sess->subscribed)
             {
                 auto it = subs_.find(id);
                 if (it == subs_.end())
@@ -752,7 +758,7 @@ namespace netx
                 if (vec.empty())
                     subs_.erase(it);
             }
-            for (uint32_t id : normalized)
+            for (const auto& id : normalized)
             {
                 subs_[id].push_back(conn);
             }
@@ -767,7 +773,7 @@ namespace netx
         if (!sess)
             return;
         std::lock_guard<std::mutex> lk(subs_mu_);
-        for (uint32_t id : sess->subscribed)//// 遍历这个连接订阅的所有灯
+        for (const auto& id : sess->subscribed)//// 遍历这个连接订阅的所有灯
         {
             auto it = subs_.find(id);
             if (it == subs_.end())
@@ -786,13 +792,13 @@ namespace netx
         sess->subscribed.clear();
     }
 
-    void WebSocketServer::PublishTo(uint32_t id, std::string_view payload)
+    void WebSocketServer::PublishTo(std::string_view id, std::string_view payload)
     {
         std::vector<std::shared_ptr<TcpConnection>> targets;
         //锁内收集
         {
             std::lock_guard<std::mutex> lk(subs_mu_);
-            auto it = subs_.find(id);
+            auto it = subs_.find(std::string(id));
             if (it == subs_.end())
                 return;
             auto &vec = it->second;

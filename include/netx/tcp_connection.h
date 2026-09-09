@@ -1,4 +1,3 @@
-// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_TCP_CONNECTION_H_
 #define NETX_TCP_CONNECTION_H_
 

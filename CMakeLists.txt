@@ -46,6 +46,7 @@ add_library(netx STATIC
     src/websocket_server.cc
     src/timer.cc
     src/timer_wheel.cc
+    src/simulator_data_source.cc
 )
 
 # 头文件路径（PUBLIC = 使用 netx 的目标自动继承此 include 路径）
@@ -108,6 +109,22 @@ if(NETX_BUILD_EXAMPLES)
 
   add_executable(connection_timeout_test examples/connection_timeout_test.cc)
   target_link_libraries(connection_timeout_test PRIVATE netx)
+
+  add_executable(data_source_test examples/data_source_test.cc)
+  target_link_libraries(data_source_test PRIVATE netx)
+
+  add_executable(connection_pool_test examples/connection_pool_test.cc)
+  target_link_libraries(connection_pool_test PRIVATE netx)
+
+  # Redis 相关
+  find_library(HIREDIS_LIB hiredis)
+  if(HIREDIS_LIB)
+    add_executable(redis_simulator examples/redis_simulator.cc)
+    target_link_libraries(redis_simulator PRIVATE netx ${HIREDIS_LIB})
+
+    add_executable(redis_data_source_test examples/redis_data_source_test.cc)
+    target_link_libraries(redis_data_source_test PRIVATE netx ${HIREDIS_LIB})
+  endif()
 endif()
 
 # ============================================================
@@ -117,6 +134,13 @@ if(NETX_BUILD_APPS)
   # 高并发红绿灯推送服务器与客户端
   add_executable(traffic_push_server app/traffic_push/traffic_push_server.cc)
   target_link_libraries(traffic_push_server PRIVATE netx)
+
+  # 高并发红绿灯推送服务器 V2（基于数据源接口）
+  add_executable(traffic_push_server_v2 app/traffic_push/traffic_push_server_v2.cc)
+  target_link_libraries(traffic_push_server_v2 PRIVATE netx)
+  if(HIREDIS_LIB)
+    target_link_libraries(traffic_push_server_v2 PRIVATE ${HIREDIS_LIB})
+  endif()
 
   add_executable(traffic_push_client app/traffic_push/traffic_push_client.cc)
   target_link_libraries(traffic_push_client PRIVATE Threads::Threads)

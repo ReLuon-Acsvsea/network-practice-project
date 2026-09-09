@@ -1,4 +1,3 @@
-// 程序员老廖：https://space.bilibili.com/3494351095204205
 #ifndef NETX_WEBSOCKET_SERVER_H_
 #define NETX_WEBSOCKET_SERVER_H_
 
@@ -31,7 +30,7 @@ class WebSocketServer {
   void Start();
 
   // 将一条文本消息广播给订阅了指定 ID 的 WebSocket 客户端
-  void PublishTo(uint32_t id, std::string_view payload);
+  void PublishTo(std::string_view id, std::string_view payload);
 
  private:
  /* Session每个连接上的"用户档案"，
@@ -45,7 +44,7 @@ class WebSocketServer {
     kClosing：正在关闭 */
     State state = State::kHandshaking;
     std::string user_id;// 用户标识（如 "张三"）
-    std::vector<uint32_t> subscribed; // 订阅了哪些红绿灯ID
+    std::vector<std::string> subscribed; // 订阅了哪些红绿灯ID
     std::chrono::steady_clock::time_point last_heartbeat; //最后一次收到消息的时间，用于检测死连接
   };
 
@@ -58,7 +57,7 @@ class WebSocketServer {
   void HandlePingFrame(const ConnectionPtr& c, std::string_view payload);
   void HandleCloseFrame(const ConnectionPtr& c, Session* sess, std::string_view payload);
   void UpdateSubscriptions(const ConnectionPtr& c, Session* sess,
-                           const std::vector<uint32_t>& new_ids);
+                           const std::vector<std::string>& new_ids);
   void RemoveConnection(const ConnectionPtr& c);
 
   void SendText(const ConnectionPtr& c, std::string_view payload);
@@ -73,7 +72,7 @@ class WebSocketServer {
   TcpServer server_;
 
   mutable std::mutex subs_mu_;
-  std::unordered_map<uint32_t, std::vector<std::weak_ptr<TcpConnection>>> subs_;
+  std::unordered_map<std::string, std::vector<std::weak_ptr<TcpConnection>>> subs_;
 };
 
 }  // namespace netx

@@ -132,7 +132,7 @@ struct ClientOptions {
   std::string host = "127.0.0.1";        // 服务器地址
   int port = 9000;                       // 服务器端口（TcpServer 的端口）
   std::string user_id = "user1";         // 用户名
-  std::vector<uint32_t> light_ids{1, 2, 3};  // 要订阅的灯ID列表
+  std::vector<std::string> light_ids{"LIGHT-001", "LIGHT-002", "LIGHT-003"};  // 要订阅的灯ID列表
   int ping_interval_sec = 10;            // 心跳间隔（秒）
   bool verbose = false;                  // 是否打印每条更新详情
 };
@@ -169,7 +169,7 @@ bool ParseArgs(int argc, char* argv[], ClientOptions* opts) {
     } else if (arg == "--user") {
       if (!next_str(opts->user_id)) return false;
     } else if (arg == "--lights") {
-      // --lights 1,2,3 → 解析成 vector<uint32_t>{1, 2, 3}
+      // --lights LIGHT-001,LIGHT-002 → 解析成 vector<string>
       std::string v;
       if (!next_str(v)) return false;
       opts->light_ids.clear();
@@ -177,7 +177,7 @@ bool ParseArgs(int argc, char* argv[], ClientOptions* opts) {
       for (char c : v) {
         if (c == ',') {
           if (!cur.empty()) {
-            opts->light_ids.push_back(static_cast<uint32_t>(std::stoul(cur)));
+            opts->light_ids.push_back(cur);
             cur.clear();
           }
         } else {
@@ -185,7 +185,7 @@ bool ParseArgs(int argc, char* argv[], ClientOptions* opts) {
         }
       }
       if (!cur.empty()) {
-        opts->light_ids.push_back(static_cast<uint32_t>(std::stoul(cur)));
+        opts->light_ids.push_back(cur);
       }
     } else if (arg == "--ping-interval") {
       if (!next_int(opts->ping_interval_sec)) return false;
@@ -201,7 +201,7 @@ bool ParseArgs(int argc, char* argv[], ClientOptions* opts) {
     }
   }
   if (opts->light_ids.empty()) {
-    opts->light_ids = {1, 2, 3};
+    opts->light_ids = {"LIGHT-001", "LIGHT-002", "LIGHT-003"};
   }
   return true;
 }
@@ -226,20 +226,31 @@ std::string BuildLogin(const std::string& user) {
 
 // ==================== BuildSubscribe ====================
 // 功能：构造 SUBSCRIBE 消息的完整协议包
-// SUBSCRIBE body 格式：[2字节 灯数量][灯ID1(4字节)][灯ID2(4字节)]...
-// 比如订阅灯1、2、3：body = [0x00,0x03, 0x00,0x00,0x00,0x01, 0x00,0x00,0x00,0x02, 0x00,0x00,0x00,0x03]
-std::string BuildSubscribe(const std::vector<uint32_t>& ids) {
+// SUBSCRIBE body 格式：[2字节 灯数量][2字节ID长度][ID字符串]...
+// 比如订阅灯 LIGHT-001：body = [0x00,0x01, 0x00,0x09, 'L','I','G','H','T','-','0','0','1']
+std::string BuildSubscribe(const std::vector<std::string>& ids) {
   uint16_t cnt = static_cast<uint16_t>(ids.size());
   uint16_t cnt_n = htons(cnt);         // 灯数量，网络字节序
+
+  // 计算总长度
+  size_t body_len = sizeof(cnt_n);
+  for (const auto& id : ids) {
+    body_len += sizeof(uint16_t) + id.size();  // 2字节长度 + 字符串
+  }
+
   std::string body;
-  body.resize(sizeof(cnt_n) + ids.size() * sizeof(uint32_t));
+  body.resize(body_len);
   char* p = body.data();
   std::memcpy(p, &cnt_n, sizeof(cnt_n));   // 写数量
   p += sizeof(cnt_n);
-  for (uint32_t id : ids) {
-    uint32_t id_n = htonl(id);             // 每个灯ID转网络字节序
-    std::memcpy(p, &id_n, sizeof(id_n));
-    p += sizeof(id_n);
+
+  for (const auto& id : ids) {
+    uint16_t id_len = static_cast<uint16_t>(id.size());
+    uint16_t id_len_n = htons(id_len);
+    std::memcpy(p, &id_len_n, sizeof(id_len_n));  // 写ID长度
+    p += sizeof(id_len_n);
+    std::memcpy(p, id.data(), id.size());          // 写ID字符串
+    p += id.size();
   }
   return MakePacket(MsgType::kSubscribe, body.data(), body.size());
 }
@@ -391,21 +402,36 @@ int main(int argc, char* argv[]) {
         size_t body_len = total_len - sizeof(uint32_t) - sizeof(uint16_t);
 
         // 根据消息类型处理
-        // 解析 LIGHT_UPDATE body：[4字节灯ID][1字节状态][4字节剩余时间]
+        // 解析 LIGHT_UPDATE body：[2字节ID长度][ID字符串][1字节状态][4字节倒计时]
         if (type == MsgType::kLightUpdate) {
-          if (body_len >= sizeof(uint32_t) + 1 + sizeof(uint32_t)) {
-            uint32_t id_n = 0;
-            std::memcpy(&id_n, body, sizeof(id_n));
-            uint32_t id = ntohl(id_n);                      // 灯ID
-            uint8_t state = static_cast<uint8_t>(body[sizeof(uint32_t)]);  // 状态(0红/1黄/2绿)
-            uint32_t remain_n = 0;
-            std::memcpy(&remain_n, body + sizeof(uint32_t) + 1, sizeof(remain_n));
-            uint32_t remain = ntohl(remain_n);               // 剩余时间(ms)
-            ++update_count;
-            if (opts.verbose) {
-              std::cout << "[LIGHT_UPDATE] id=" << id
-                        << " state=" << static_cast<int>(state)
-                        << " remain_ms=" << remain << "\n";
+          size_t pos = 0;
+          if (body_len >= sizeof(uint16_t)) {
+            // 读ID长度
+            uint16_t id_len_n = 0;
+            std::memcpy(&id_len_n, body + pos, sizeof(id_len_n));
+            uint16_t id_len = ntohs(id_len_n);
+            pos += sizeof(uint16_t);
+
+            // 读ID字符串
+            if (pos + id_len + 1 + sizeof(uint32_t) <= body_len) {
+              std::string light_id(body + pos, id_len);
+              pos += id_len;
+
+              // 读状态（1字节）
+              uint8_t state = static_cast<uint8_t>(body[pos]);
+              pos += 1;
+
+              // 读倒计时（4字节）
+              uint32_t countdown_n = 0;
+              std::memcpy(&countdown_n, body + pos, sizeof(countdown_n));
+              uint32_t countdown = ntohl(countdown_n);
+
+              ++update_count;
+              if (opts.verbose) {
+                std::cout << "[LIGHT_UPDATE] id=" << light_id
+                          << " state=" << static_cast<int>(state)
+                          << " countdown=" << countdown << "s\n";
+              }
             }
           }
         } else if (type == MsgType::kPong) {
