@@ -181,7 +181,7 @@ constexpr char kFallbackIndexHtml[] = R"(<!DOCTYPE html>
     <div class="controls">
       <label>订阅红绿灯ID（用逗号分隔）</label>
       <div class="control-row">
-        <input id="light-input" value="LIGHT-001,LIGHT-002,LIGHT-003,LIGHT-004" />
+        <input id="light-input" value="L-1,L-2,L-3,L-4" />
         <button id="subscribe-btn">更新订阅</button>
       </div>
     </div>
@@ -210,7 +210,7 @@ const setStatus=(text)=>{statusEl.textContent=text;};
 const colorName=(color)=>{switch(color){case 0:return'红';case 1:return'黄';case 2:return'绿';default:return'未知';}};
 const render=()=>{if(lights.size===0){lightsEl.innerHTML='';lightsEl.style.display='none';return;}
 lightsEl.style.display='grid';lightsEl.innerHTML='';
-Array.from(lights.entries()).sort((a,b)=>a[0].localeCompare(b[0])).forEach(([id,info])=>{
+Array.from(lights.entries()).sort((a,b)=>{const na=parseInt(a[0].replace(/\D/g,''))||0;const nb=parseInt(b[0].replace(/\D/g,''))||0;return na-nb;}).forEach(([id,info])=>{
 const colorClass=info.color===0?'red':info.color===1?'yellow':'green';
 const card=document.createElement('div');
 card.className=`light-card ${colorClass}`;
@@ -302,6 +302,7 @@ class SubscriptionManager {
   // 更新某连接的订阅集合：new_ids 为完整新集合
   void UpdateSubscriptions(const ConnectionPtr& conn,
                            const std::vector<std::string>& new_ids) {
+    std::lock_guard<std::mutex> lock(mu_);
     // 从旧订阅中移除该连接
     for (auto it = subs_.begin(); it != subs_.end();) {
       auto& vec = it->second;
@@ -326,6 +327,7 @@ class SubscriptionManager {
 
   // 连接关闭时清理其所有订阅
   void RemoveConnection(const ConnectionPtr& conn) {
+    std::lock_guard<std::mutex> lock(mu_);
     for (auto it = subs_.begin(); it != subs_.end();) {
       auto& vec = it->second;
       vec.erase(std::remove_if(vec.begin(), vec.end(),
@@ -342,29 +344,41 @@ class SubscriptionManager {
     }
   }
 
-  // 遍历某个灯ID的所有订阅连接
+  // 遍历某个灯ID的所有订阅连接（锁内复制，锁外发送，减少持锁时间）
   template <typename F>
   void ForEachSubscriber(const std::string& light_id, F&& f) {
-    auto it = subs_.find(light_id);
-    if (it == subs_.end()) return;
-    auto& vec = it->second;
-    for (auto iter = vec.begin(); iter != vec.end();) {
-      auto sp = iter->lock();
-      if (!sp || !sp->IsConnected()) {
-        iter = vec.erase(iter);
-        continue;
+    std::vector<ConnectionPtr> alive;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = subs_.find(light_id);
+      if (it == subs_.end()) return;
+      auto& vec = it->second;
+      for (auto iter = vec.begin(); iter != vec.end();) {
+        auto sp = iter->lock();
+        if (!sp || !sp->IsConnected()) {
+          iter = vec.erase(iter);
+          continue;
+        }
+        alive.push_back(std::move(sp));
+        ++iter;
       }
-      f(sp);
-      ++iter;
+      if (vec.empty()) {
+        subs_.erase(it);
+      }
     }
-    if (vec.empty()) {
-      subs_.erase(it);
+    // 锁外执行发送，不阻塞其他线程
+    for (auto& c : alive) {
+      f(c);
     }
   }
 
-  size_t LightCount() const { return subs_.size(); }
+  size_t LightCount() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return subs_.size();
+  }
 
  private:
+  mutable std::mutex mu_;
   std::unordered_map<std::string, std::vector<std::weak_ptr<TcpConnection>>> subs_;
 };
 
@@ -394,7 +408,7 @@ class TrafficPushServerV2 {
                       std::string web_root,
                       std::unique_ptr<DataSource> data_source)
       : base_loop_(base_loop),
-        server_(base_loop, listen_addr, io_threads, /*reuse_port=*/false),
+        server_(base_loop, listen_addr, io_threads, /*reuse_port=*/true),
         http_port_(http_port),
         ws_port_(ws_port),
         web_root_(std::move(web_root)),

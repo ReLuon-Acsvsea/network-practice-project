@@ -16,10 +16,13 @@ bool SimulatorDataSource::InitFromConfig(const SimulatorConfig& config) {
     config_ = config;
     intersections_ = config.intersections;
 
-    // 初始化各路口的启动时间
+    // 初始化各路口的启动时间，均匀错开让每个路口处于不同相位
     uint64_t now = NowMs();
-    for (const auto& intersection : intersections_) {
-        start_times_[intersection.id] = now;
+    int n = static_cast<int>(intersections_.size());
+    for (int i = 0; i < n; ++i) {
+        int cycle_ms = intersections_[i].schedule.CycleDuration() * 1000;
+        int offset_ms = (n > 1) ? (cycle_ms * i / n) : 0;
+        start_times_[intersections_[i].id] = now - offset_ms;
     }
 
     LOG_INFO << "SimulatorDataSource initialized with "
@@ -37,55 +40,47 @@ bool SimulatorDataSource::InitFromFile(const std::string& file_path) {
 bool SimulatorDataSource::InitDefault() {
     SimulatorConfig config;
 
-    // 创建路口 1：人民路-中山路路口
-    Intersection intersection1;
-    intersection1.id = "INT-001";
-    intersection1.name = "人民路-中山路路口";
-    intersection1.latitude = 31.2304;
-    intersection1.longitude = 121.4737;
+    // 生成50个路口，每个路口4个方向
+    const int kNumIntersections = 50;
+    const std::vector<std::string> directions = {"东", "南", "西", "北"};
 
-    // 4 个方向的红绿灯
-    intersection1.lights = {
-        {"LIGHT-001", "INT-001", "东", LightType::kVehicle, LightColor::kRed, 27, 0},
-        {"LIGHT-002", "INT-001", "南", LightType::kVehicle, LightColor::kGreen, 30, 0},
-        {"LIGHT-003", "INT-001", "西", LightType::kVehicle, LightColor::kRed, 27, 0},
-        {"LIGHT-004", "INT-001", "北", LightType::kVehicle, LightColor::kGreen, 30, 0}
-    };
+    for (int i = 1; i <= kNumIntersections; ++i) {
+        Intersection intersection;
+        intersection.id = "INT-" + std::to_string(i);
+        intersection.name = "路口-" + std::to_string(i);
+        intersection.latitude = 31.23 + i * 0.001;
+        intersection.longitude = 121.47 + i * 0.001;
 
-    // 时序方案：绿灯30秒 -> 黄灯3秒 -> 红灯27秒
-    intersection1.schedule.id = "SCHEDULE-001";
-    intersection1.schedule.phases = {
-        {LightColor::kGreen, 30},
-        {LightColor::kYellow, 3},
-        {LightColor::kRed, 27}
-    };
+        // 4个方向的红绿灯
+        int light_base = (i - 1) * 4 + 1;
+        for (int d = 0; d < 4; ++d) {
+            TrafficLight light;
+            light.id = "L-" + std::to_string(light_base + d);
+            light.intersection_id = intersection.id;
+            light.direction = directions[d];
+            light.type = LightType::kVehicle;
+            // 东西方向绿灯在前，南北方向红灯在前
+            if (d < 2) {
+                light.color = LightColor::kGreen;
+                light.countdown = 30;
+            } else {
+                light.color = LightColor::kRed;
+                light.countdown = 33;
+            }
+            light.timestamp = 0;
+            intersection.lights.push_back(light);
+        }
 
-    config.intersections.push_back(intersection1);
+        // 时序方案：绿灯30秒 -> 黄灯3秒 -> 红灯27秒
+        intersection.schedule.id = "SCH-" + std::to_string(i);
+        intersection.schedule.phases = {
+            {LightColor::kGreen, 30},
+            {LightColor::kYellow, 3},
+            {LightColor::kRed, 27}
+        };
 
-    // 创建路口 2：南京路-淮海路路口
-    Intersection intersection2;
-    intersection2.id = "INT-002";
-    intersection2.name = "南京路-淮海路路口";
-    intersection2.latitude = 31.2320;
-    intersection2.longitude = 121.4750;
-
-    // 4 个方向的红绿灯
-    intersection2.lights = {
-        {"LIGHT-005", "INT-002", "东", LightType::kVehicle, LightColor::kGreen, 25, 0},
-        {"LIGHT-006", "INT-002", "南", LightType::kVehicle, LightColor::kRed, 35, 0},
-        {"LIGHT-007", "INT-002", "西", LightType::kVehicle, LightColor::kGreen, 25, 0},
-        {"LIGHT-008", "INT-002", "北", LightType::kVehicle, LightColor::kRed, 35, 0}
-    };
-
-    // 时序方案：绿灯25秒 -> 黄灯3秒 -> 红灯32秒
-    intersection2.schedule.id = "SCHEDULE-002";
-    intersection2.schedule.phases = {
-        {LightColor::kGreen, 25},
-        {LightColor::kYellow, 3},
-        {LightColor::kRed, 32}
-    };
-
-    config.intersections.push_back(intersection2);
+        config.intersections.push_back(intersection);
+    }
 
     config.update_interval_ms = 1000;  // 每秒更新一次
 

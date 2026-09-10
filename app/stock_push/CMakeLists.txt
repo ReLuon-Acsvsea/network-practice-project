@@ -1,0 +1,5 @@
+add_executable(stock_push_server stock_push_server.cc)
+target_link_libraries(stock_push_server PRIVATE netx)
+
+add_executable(stock_push_client stock_push_client.cc)
+target_link_libraries(stock_push_client PRIVATE Threads::Threads)

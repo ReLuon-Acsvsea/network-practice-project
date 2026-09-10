@@ -213,6 +213,61 @@ public:
         return true;
     }
 
+    // HSET 多字段版本（一次命令设置多个字段）
+    bool HMSet(const std::string& key,
+               const std::unordered_map<std::string, std::string>& fields) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ctx_ || fields.empty()) return false;
+
+        // 构建 HSET key field1 value1 field2 value2 ...
+        std::string cmd = "HSET " + key;
+        for (const auto& [field, value] : fields) {
+            cmd += " " + field + " " + value;
+        }
+
+        redisReply* reply = static_cast<redisReply*>(
+            redisCommand(ctx_, cmd.c_str()));
+        if (!reply) return false;
+
+        bool ok = (reply->type == REDIS_REPLY_INTEGER ||
+                   reply->type == REDIS_REPLY_STATUS);
+        freeReplyObject(reply);
+        return ok;
+    }
+
+    // Pipeline 批量 HSet（一次往返完成多组写入）
+    // 返回成功写入的数量
+    int PipelineHSet(const std::vector<std::pair<std::string,
+                      std::unordered_map<std::string, std::string>>>& batch) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!ctx_ || batch.empty()) return 0;
+
+        // 发送阶段：把所有命令追加到管道
+        for (const auto& [key, fields] : batch) {
+            std::string cmd = "HSET " + key;
+            for (const auto& [field, value] : fields) {
+                cmd += " " + field + " " + value;
+            }
+            redisAppendCommand(ctx_, cmd.c_str());
+        }
+
+        // 接收阶段：逐个取回复
+        int ok_count = 0;
+        for (size_t i = 0; i < batch.size(); ++i) {
+            redisReply* reply = nullptr;
+            redisGetReply(ctx_, reinterpret_cast<void**>(&reply));
+            if (!reply) break;
+
+            if (reply->type == REDIS_REPLY_INTEGER ||
+                reply->type == REDIS_REPLY_STATUS) {
+                ++ok_count;
+            }
+            freeReplyObject(reply);
+        }
+
+        return ok_count;
+    }
+
     // KEYS 命令（返回所有匹配的 key）
     bool Keys(const std::string& pattern, std::vector<std::string>* result) {
         std::lock_guard<std::mutex> lock(mu_);

@@ -22,7 +22,7 @@ class Socket {
   static int CreateNonblockingReusePort();
 
   void Bind(const InetAddress& addr);
-  void Listen(int backlog = 4096);
+  void Listen(int backlog = 65535);
   int Accept(InetAddress* peer);
 
   void SetReuseAddr(bool on);

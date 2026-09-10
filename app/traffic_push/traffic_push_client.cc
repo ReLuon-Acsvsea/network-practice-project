@@ -13,7 +13,9 @@
 // ==================== 头文件 ====================
 // 以下都是 C 的网络头文件，和你以前 Mydir 里写的一样
 #include <arpa/inet.h>    // htonl/htons/ntohl/ntohs 字节序转换
+#include <fcntl.h>        // fcntl O_NONBLOCK
 #include <netdb.h>        // getaddrinfo/addrinfo DNS 解析
+#include <sys/select.h>   // select 超时
 #include <sys/socket.h>   // socket/connect/send/recv
 #include <unistd.h>       // close
 
@@ -106,21 +108,18 @@ int ConnectTo(const std::string& host, int port) {
     return -1;
   }
 
-  // 遍历所有地址尝试连接（可能有 IPv4/IPv6 多个结果）
+  // 遍历所有地址尝试连接（阻塞，无超时，等内核 TCP 重传）
   int fd = -1;
   for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
     fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    // p->ai_family = AF_INET 或 AF_INET6，自动判断
-    // p->ai_socktype = SOCK_STREAM
-    // p->ai_protocol = IPPROTO_TCP
-    if (fd < 0) continue;              // socket 创建失败，试下一个地址
+    if (fd < 0) continue;
     if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
-      break;                           // 连接成功，跳出循环
+      break;
     }
-    ::close(fd);                       // 连接失败，关闭这个 socket 防止泄漏
-    fd = -1;                           // 标记无效
+    ::close(fd);
+    fd = -1;
   }
-  freeaddrinfo(res);                   // 释放链表（C 的内存管理，必须手动 free）
+  freeaddrinfo(res);
   return fd;
 }
 

@@ -765,16 +765,8 @@ class StockPushServer {
 
     // 推给 WebSocket 客户端
     if (ws_server_) {
-      uint32_t id = 0;
-      auto it = code_to_id_.find(u.code);
-      if (it != code_to_id_.end()) {
-        id = it->second;
-      } else {
-        id = next_id_++;
-        code_to_id_[u.code] = id;
-      }
       std::string json = BuildStockUpdateJson(u);
-      ws_server_->PublishTo(id, json);
+      ws_server_->PublishTo(u.code, json);
     }
   }
 
