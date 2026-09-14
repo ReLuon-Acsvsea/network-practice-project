@@ -56,7 +56,4 @@ void Acceptor::HandleRead() {
 
 }  // namespace netx
 
-// test CI error
-int broken =
-
 
