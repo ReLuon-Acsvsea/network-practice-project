@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ feature/connection-pool ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ feature/connection-pool ]
 
 jobs:
   build:
